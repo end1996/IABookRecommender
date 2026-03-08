@@ -64,72 +64,63 @@ tfidf_matrix = vectorizer.fit_transform(df['Texto_IA'])
 
 print("4. Generando recomendaciones (Fase 1 y 2) e insertando por lotes...")
 try:
-    # Usamos el engine para obtener una conexión directa para el TRUNCATE e INSERT
+    # engine.begin() abre la conexión, inicia la transacción y cierra todo al finalizar el bloque
     with engine.begin() as conn:
-    # Vaciamos la tabla de recomendaciones anteriores antes de empezar
+        # 1. Limpiamos la tabla
         conn.execute(text("TRUNCATE TABLE product_recommendations"))
-    
-        sql_insert = "INSERT INTO product_recommendations (source_sku, recommended_sku, rank_order) VALUES (%s, %s, %s)"
+        
+        # 2. Definimos la consulta con parámetros nombrados (:nombre)
+        sql_insert = text("""
+            INSERT INTO product_recommendations (source_sku, recommended_sku, rank_order) 
+            VALUES (:s, :r, :o)
+        """)
+        
         lote_datos = []
-    
+        
         for idx in tqdm(range(len(df)), desc="Procesando Catálogo"):
-            titulo_base_actual = titulos_base[idx]
-            categoria_actual = lista_categorias[idx]
-            idioma_actual = lista_idiomas[idx]
             sku_actual = lista_ids[idx]
-
-            # OPTIMIZACIÓN DE RAM: Calculamos similitud solo para el libro actual (1 x N)
+            
+            # Cálculo de similitud
             sim_vector = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).flatten()
             sim_scores_indices = np.argsort(-sim_vector)
-        
-            recomendados_para_este_libro = []
-            ids_ya_recomendados = set()
-
-        # FASE 1: Estricta
-        for i in sim_scores_indices:
-            if i == idx or not lista_textos_limpios[i] or titulos_base[i] == titulo_base_actual or lista_idiomas[i] != idioma_actual:
-                continue
-            if lista_categorias[i] != categoria_actual:
-                continue
-
-            recomendados_para_este_libro.append(lista_ids[i])
-            ids_ya_recomendados.add(lista_ids[i])
-            if len(recomendados_para_este_libro) == CANTIDAD_RECOMENDACIONES:
-                break
-
-        # FASE 2: Relajada
-        if len(recomendados_para_este_libro) < CANTIDAD_RECOMENDACIONES:
-            for i in sim_scores_indices:
-                if i == idx or not lista_textos_limpios[i] or titulos_base[i] == titulo_base_actual or lista_idiomas[i] != idioma_actual:
-                    continue
-                
-                if lista_ids[i] not in ids_ya_recomendados:
-                    recomendados_para_este_libro.append(lista_ids[i])
-                    ids_ya_recomendados.add(lista_ids[i])
-
-                if len(recomendados_para_este_libro) == CANTIDAD_RECOMENDACIONES:
-                    break
-
-        # Añadimos al lote actual
-        for rank, rec_sku in enumerate(recomendados_para_este_libro, start=1):
-            lote_datos.append((sku_actual, rec_sku, rank))
             
-        # GUARDADO POR LOTES: Cada 100 libros procesados, guardamos en BD y limpiamos RAM
-        if (idx + 1) % 100 == 0:
-            if lote_datos:
-                conn.execute(sql_insert, lote_datos)
-                lote_datos.clear() # Liberamos memoria
+            recomendados = []
+            vistos = set()
 
-    # Guardamos cualquier residuo que haya quedado en el último lote
-    if lote_datos:
-        conn.execute(sql_insert, lote_datos)
+            # FASE 1: Estricta
+            for i in sim_scores_indices:
+                if i == idx or not lista_textos_limpios[i] or titulos_base[i] == titulos_base[idx] or lista_idiomas[i] != lista_idiomas[idx]:
+                    continue
+                if lista_categorias[i] == lista_categorias[idx]:
+                    recomendados.append(lista_ids[i])
+                    vistos.add(lista_ids[i])
+                if len(recomendados) >= CANTIDAD_RECOMENDACIONES: break
+
+            # FASE 2: Relajada
+            if len(recomendados) < CANTIDAD_RECOMENDACIONES:
+                for i in sim_scores_indices:
+                    if i == idx or not lista_textos_limpios[i] or titulos_base[i] == titulos_base[idx] or lista_idiomas[i] != lista_idiomas[idx]:
+                        continue
+                    if lista_ids[i] not in vistos:
+                        recomendados.append(lista_ids[i])
+                        vistos.add(lista_ids[i])
+                    if len(recomendados) >= CANTIDAD_RECOMENDACIONES: break
+
+            # PREPARACIÓN DEL LOTE (Como Diccionarios)
+            for rank, rec_sku in enumerate(recomendados, start=1):
+                lote_datos.append({"s": sku_actual, "r": rec_sku, "o": rank})
+            
+            # Inserción cada 100 libros
+            if (idx + 1) % 100 == 0 and lote_datos:
+                conn.execute(sql_insert, lote_datos)
+                lote_datos.clear()
+
+        # Insertar los últimos registros restantes
+        if lote_datos:
+            conn.execute(sql_insert, lote_datos)
         
     print("¡Éxito! Proceso finalizado y base de datos actualizada.")
 
 except Exception as e:
+    # No hace falta conn.rollback(), engine.begin() lo hace solo si detecta una excepción
     print(f"Error durante el procesamiento/guardado: {e}")
-    conn.rollback()
-finally:
-    if 'conn' in locals() and conn.is_connected():
-        cursor.close()
-        conn.close()
