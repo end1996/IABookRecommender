@@ -5,14 +5,7 @@ import numpy as np
 from tqdm import tqdm
 import re
 import mysql.connector
-
-# --- CONFIGURACIÓN DE BASE DE DATOS ---
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',       # Cambia por tu usuario
-    'password': '',       # Cambia por tu contraseña
-    'database': ''        # Cambia por tu BD
-}
+from config.settings import DB_CONFIG, CANTIDAD_RECOMENDACIONES
 
 CANTIDAD_RECOMENDACIONES = 20
 
