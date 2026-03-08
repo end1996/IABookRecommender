@@ -1,11 +1,19 @@
 import pandas as pd
+from sqlalchemy import create_engine, text
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from tqdm import tqdm
 import re
-import mysql.connector
 from config.settings import DB_CONFIG, CANTIDAD_RECOMENDACIONES
+
+# Construimos la URL usando el diccionario de settings.py
+DB_URL = (
+    f"mysql+mysqlconnector://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
+    f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+)
+
+engine = create_engine(DB_URL)
 
 CANTIDAD_RECOMENDACIONES = 20
 
@@ -23,15 +31,14 @@ def extraer_titulo_base(titulo):
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
-print("1. Conectando a la Base de Datos y extrayendo catálogo...")
+print("1. Conectando y extrayendo catálogo con SQLAlchemy...")
 try:
-    conn = mysql.connector.connect(**DB_CONFIG)
     query = """
         SELECT sku, title, category, description, language 
         FROM books 
         WHERE description IS NOT NULL AND description != ''
     """
-    df = pd.read_sql(query, conn)
+    df = pd.read_sql(query, engine)
 except Exception as e:
     print(f"Error de conexión: {e}")
     exit()
@@ -57,25 +64,26 @@ tfidf_matrix = vectorizer.fit_transform(df['Texto_IA'])
 
 print("4. Generando recomendaciones (Fase 1 y 2) e insertando por lotes...")
 try:
-    cursor = conn.cursor()
+    # Usamos el engine para obtener una conexión directa para el TRUNCATE e INSERT
+    with engine.begin() as conn:
     # Vaciamos la tabla de recomendaciones anteriores antes de empezar
-    cursor.execute("TRUNCATE TABLE product_recommendations")
+        conn.execute(text("TRUNCATE TABLE product_recommendations"))
     
-    sql_insert = "INSERT INTO product_recommendations (source_sku, recommended_sku, rank_order) VALUES (%s, %s, %s)"
-    lote_datos = []
+        sql_insert = "INSERT INTO product_recommendations (source_sku, recommended_sku, rank_order) VALUES (%s, %s, %s)"
+        lote_datos = []
     
-    for idx in tqdm(range(len(df)), desc="Procesando Catálogo"):
-        titulo_base_actual = titulos_base[idx]
-        categoria_actual = lista_categorias[idx]
-        idioma_actual = lista_idiomas[idx]
-        sku_actual = lista_ids[idx]
+        for idx in tqdm(range(len(df)), desc="Procesando Catálogo"):
+            titulo_base_actual = titulos_base[idx]
+            categoria_actual = lista_categorias[idx]
+            idioma_actual = lista_idiomas[idx]
+            sku_actual = lista_ids[idx]
 
-        # OPTIMIZACIÓN DE RAM: Calculamos similitud solo para el libro actual (1 x N)
-        sim_vector = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).flatten()
-        sim_scores_indices = np.argsort(-sim_vector)
+            # OPTIMIZACIÓN DE RAM: Calculamos similitud solo para el libro actual (1 x N)
+            sim_vector = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).flatten()
+            sim_scores_indices = np.argsort(-sim_vector)
         
-        recomendados_para_este_libro = []
-        ids_ya_recomendados = set()
+            recomendados_para_este_libro = []
+            ids_ya_recomendados = set()
 
         # FASE 1: Estricta
         for i in sim_scores_indices:
@@ -109,14 +117,12 @@ try:
         # GUARDADO POR LOTES: Cada 100 libros procesados, guardamos en BD y limpiamos RAM
         if (idx + 1) % 100 == 0:
             if lote_datos:
-                cursor.executemany(sql_insert, lote_datos)
-                conn.commit()
+                conn.execute(sql_insert, lote_datos)
                 lote_datos.clear() # Liberamos memoria
 
     # Guardamos cualquier residuo que haya quedado en el último lote
     if lote_datos:
-        cursor.executemany(sql_insert, lote_datos)
-        conn.commit()
+        conn.execute(sql_insert, lote_datos)
         
     print("¡Éxito! Proceso finalizado y base de datos actualizada.")
 
