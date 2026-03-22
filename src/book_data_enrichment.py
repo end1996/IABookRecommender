@@ -1,0 +1,608 @@
+"""
+Script de Enriquecimiento del Catálogo de Libros
+=================================================
+Enriquece la base de datos de libros en dos fases:
+  Fase 1: Detecta/corrige el idioma usando la librería lingua (offline).
+  Fase 2: Rellena descripciones faltantes usando Google Books API + Ollama local.
+
+Uso:
+  python -m src.book_data_enrichment                           # Ejecutar todo
+  python -m src.book_data_enrichment --phase language           # Solo idiomas
+  python -m src.book_data_enrichment --phase description        # Solo descripciones
+  python -m src.book_data_enrichment --dry-run                  # Preview sin escribir BD
+  python -m src.book_data_enrichment --limit 20 --dry-run       # Solo 20 libros, preview
+"""
+
+import argparse
+import json
+import re
+import sys
+import time
+
+# Fix para consolas de Windows que no soportan emoji/Unicode por defecto
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import requests
+from lingua import Language, LanguageDetectorBuilder
+from sqlalchemy import create_engine, text
+from tqdm import tqdm
+
+from config.settings import (
+    DB_CONFIG,
+    GOOGLE_BOOKS_API_KEY,
+    LM_STUDIO_BASE_URL,
+    LM_STUDIO_MODEL,
+)
+
+# =====================================================
+# Conexión a BD (mismo patrón que book_recommender.py)
+# =====================================================
+DB_URL = (
+    f"mysql+mysqlconnector://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
+    f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+)
+engine = create_engine(DB_URL)
+
+# =====================================================
+# Configuración de lingua
+# =====================================================
+# Solo los idiomas relevantes para el catálogo
+# Esto mejora la precisión y reduce memoria (~20MB vs ~100MB con todos)
+IDIOMAS_SOPORTADOS = [Language.SPANISH, Language.ENGLISH, Language.PORTUGUESE, Language.FRENCH]
+
+detector = LanguageDetectorBuilder.from_languages(*IDIOMAS_SOPORTADOS) \
+    .with_minimum_relative_distance(0.25) \
+    .build()
+
+# Mapeo de lingua Language enum → nombre legible para la BD
+LINGUA_A_BD = {
+    Language.SPANISH: "Spanish",
+    Language.ENGLISH: "English",
+    Language.PORTUGUESE: "Portuguese",
+    Language.FRENCH: "French",
+}
+
+# Idiomas que se consideran "incorrectos" o genéricos y deben re-evaluarse
+IDIOMAS_INVALIDOS = {"", "Desconocido", "Unknown", "N/A", "null", "None"}
+
+# =====================================================
+# Mapeo de idioma → instrucciones de idioma para el LLM
+# =====================================================
+IDIOMA_INSTRUCCION = {
+    "Spanish": "en español",
+    "English": "in English",
+    "Portuguese": "em português",
+    "French": "en français",
+}
+
+
+# =====================================================
+# Utilidades
+# =====================================================
+def limpiar_html(texto):
+    """Elimina etiquetas HTML de un texto."""
+    return re.sub(r'<[^>]+>', ' ', str(texto)).strip()
+
+
+def es_idioma_valido(idioma):
+    """Retorna True si el idioma es un valor válido y no necesita corrección."""
+    if not idioma:
+        return False
+    idioma_str = str(idioma).strip()
+    return idioma_str not in IDIOMAS_INVALIDOS
+
+
+# =====================================================
+# FASE 1: Detección de idioma (lingua + LM Studio fallback)
+# =====================================================
+
+# Valores aceptados para el campo language en la BD
+IDIOMAS_ACEPTADOS = {"Spanish", "English", "Portuguese", "French"}
+
+
+def detectar_idioma(titulo, autor=""):
+    """Detecta el idioma de un libro usando lingua (offline).
+    
+    Retorna 'Spanish', 'English', etc. o None si no se puede detectar.
+    """
+    texto = f"{titulo} {autor}".strip()
+    if not texto or len(texto) < 2:
+        return None
+
+    resultado = detector.detect_language_of(texto)
+    if resultado and resultado in LINGUA_A_BD:
+        return LINGUA_A_BD[resultado]
+    return None
+
+
+def extraer_respuesta_lm(data):
+    """Extrae el texto de respuesta del JSON de LM Studio.
+    
+    Modelos con thinking mode (Qwen 3.5, DeepSeek R1) pueden devolver:
+    - content: vacío, reasoning_content: con la respuesta
+    - content: '<think>...</think>\nrespuesta'
+    - content: 'respuesta' (modelos normales como Qwen 2.5)
+    """
+    message = data["choices"][0]["message"]
+    content = (message.get("content") or "").strip()
+    reasoning = (message.get("reasoning_content") or "").strip()
+
+    # Si content tiene bloques <think>, eliminarlos
+    content_limpio = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+
+    # Prioridad: content limpio > reasoning_content > content raw
+    if content_limpio:
+        return content_limpio
+    if reasoning:
+        return reasoning
+    return content
+
+
+def detectar_idioma_lm_studio(titulo, autor=""):
+    """Fallback: detecta el idioma de un libro usando LM Studio (para títulos
+    ambiguos, bilingües o demasiado cortos que lingua no pudo resolver).
+    
+    Retorna 'Spanish', 'English', etc. o None si falla.
+    """
+    system_msg = (
+        "You are a language detection assistant. You determine the PRIMARY language "
+        "of book titles. Respond with ONLY ONE of these exact words: "
+        "Spanish, English, Portuguese, French. "
+        "Do NOT explain your reasoning. Output ONLY the language name."
+    )
+    user_msg = (
+        f"What is the primary language of this book?\n"
+        f"Title: {titulo}\n"
+        f"Author: {autor or 'Unknown'}"
+    )
+
+    try:
+        resp = requests.post(
+            f"{LM_STUDIO_BASE_URL}/v1/chat/completions",
+            json={
+                "model": LM_STUDIO_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 150,
+                "stream": False,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        respuesta = extraer_respuesta_lm(data).strip(".")
+
+        # Validar contra whitelist — match exacto primero
+        for idioma in IDIOMAS_ACEPTADOS:
+            if idioma.lower() == respuesta.lower().strip():
+                return idioma
+
+        # Fallback: match parcial
+        for idioma in IDIOMAS_ACEPTADOS:
+            if idioma.lower() in respuesta.lower():
+                return idioma
+
+        # Debug: mostrar qué respondió el modelo cuando no se pudo parsear
+        tqdm.write(f"   🔍 Debug: respuesta='{respuesta[:80]}'")
+
+    except requests.RequestException as e:
+        tqdm.write(f"   ❌ Error LM Studio API: {e}")
+    except (KeyError, IndexError) as e:
+        tqdm.write(f"   ❌ Respuesta inesperada: {e}")
+
+    return None
+
+
+def fase_idioma(dry_run=False, limit=None):
+    """Fase 1: Detecta y corrige el idioma de libros con language NULL/inválido.
+    
+    Nivel 1: lingua (offline, instantáneo) — cubre ~89% de los títulos.
+    Nivel 2: LM Studio (modelo local) — para títulos bilingües, cortos o ambiguos.
+    """
+    print("\n" + "=" * 60)
+    print("📖 FASE 1: Detección de idioma")
+    print("=" * 60)
+
+    # Consultar libros que necesitan idioma
+    query = """
+        SELECT id, sku, title, author, language
+        FROM books
+        WHERE language IS NULL OR TRIM(language) = ''
+           OR language IN ('Desconocido', 'Unknown', 'N/A', 'null', 'None')
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query)).fetchall()
+
+    if not rows:
+        print("   ✅ No hay libros con idioma faltante/inválido.")
+        return {"total": 0, "lingua": 0, "lm_studio": 0, "no_detectados": 0}
+
+    print(f"   → {len(rows)} libros necesitan detección de idioma")
+
+    # Verificar disponibilidad de LM Studio para fallback
+    lm_studio_disponible = False
+    try:
+        resp = requests.get(f"{LM_STUDIO_BASE_URL}/v1/models", timeout=5)
+        if resp.status_code == 200:
+            modelos = [m["id"] for m in resp.json().get("data", [])]
+            lm_studio_disponible = len(modelos) > 0
+            if lm_studio_disponible:
+                print(f"   ✅ LM Studio disponible como fallback para títulos ambiguos")
+            else:
+                print(f"   ⚠️ LM Studio activo pero sin modelos cargados.")
+    except requests.RequestException:
+        print("   ℹ️ LM Studio no disponible. Solo se usará lingua (offline).")
+
+    count_lingua = 0
+    count_lm_studio = 0
+    no_detectados = 0
+    pendientes_lm = []  # Libros que lingua no pudo detectar
+    cambios = []
+
+    # --- Paso 1: lingua (offline, instantáneo) ---
+    print("\n   Nivel 1: lingua (offline)...")
+    for row in tqdm(rows, desc="lingua"):
+        book_id, sku, titulo, autor, idioma_actual = row
+        idioma_detectado = detectar_idioma(titulo or "", autor or "")
+
+        if idioma_detectado:
+            cambios.append({
+                "id": book_id, "sku": sku, "titulo": titulo,
+                "idioma_anterior": idioma_actual or "NULL",
+                "idioma_nuevo": idioma_detectado, "fuente": "lingua",
+            })
+            count_lingua += 1
+        else:
+            pendientes_lm.append(row)
+
+    print(f"   → lingua detectó {count_lingua}/{len(rows)} idiomas")
+
+    # --- Paso 2: LM Studio fallback (para los que lingua no pudo) ---
+    if pendientes_lm and lm_studio_disponible:
+        print(f"\n   Nivel 2: LM Studio fallback ({len(pendientes_lm)} pendientes)...")
+        for row in tqdm(pendientes_lm, desc="LM Studio"):
+            book_id, sku, titulo, autor, idioma_actual = row
+            idioma_detectado = detectar_idioma_lm_studio(titulo or "", autor or "")
+
+            if idioma_detectado:
+                cambios.append({
+                    "id": book_id, "sku": sku, "titulo": titulo,
+                    "idioma_anterior": idioma_actual or "NULL",
+                    "idioma_nuevo": idioma_detectado, "fuente": "LM Studio",
+                })
+                count_lm_studio += 1
+            else:
+                no_detectados += 1
+                tqdm.write(f"   ⚠️ No detectado: [{sku}] {titulo}")
+    else:
+        no_detectados = len(pendientes_lm)
+        if pendientes_lm and not lm_studio_disponible:
+            print(f"\n   ⚠️ {len(pendientes_lm)} libros sin detectar (LM Studio no disponible para fallback)")
+            for row in pendientes_lm[:10]:
+                print(f"      [{row[1]}] {row[2]}")
+            if len(pendientes_lm) > 10:
+                print(f"      ... y {len(pendientes_lm) - 10} más")
+
+    # Aplicar cambios a BD (o solo mostrar en dry-run)
+    if cambios:
+        if dry_run:
+            print(f"\n🔍 DRY-RUN: Se actualizarían {len(cambios)} libros:")
+            for c in cambios[:15]:
+                print(f"   [{c['sku']}] \"{c['titulo'][:50]}\" → {c['idioma_nuevo']} ({c['fuente']})")
+            if len(cambios) > 15:
+                print(f"   ... y {len(cambios) - 15} más")
+        else:
+            print(f"\n💾 Guardando {len(cambios)} idiomas en la BD...")
+            with engine.begin() as conn:
+                sql = text("UPDATE books SET language = :lang WHERE id = :id")
+                for c in cambios:
+                    conn.execute(sql, {"lang": c["idioma_nuevo"], "id": c["id"]})
+            print("   ✅ Idiomas actualizados correctamente.")
+
+    stats = {
+        "total": len(rows), "lingua": count_lingua,
+        "lm_studio": count_lm_studio, "no_detectados": no_detectados,
+    }
+    total_ok = count_lingua + count_lm_studio
+    print(f"\n📊 Fase 1: {count_lingua} lingua + {count_lm_studio} LM Studio = {total_ok} detectados, {no_detectados} sin detectar")
+    return stats
+
+
+# =====================================================
+# FASE 2: Enriquecimiento de descripciones
+# =====================================================
+
+# --- Nivel 1: Google Books API ---
+def buscar_google_books(isbn, titulo=""):
+    """Busca la descripción de un libro en Google Books API por ISBN.
+    
+    Retorna la descripción (str) o None si no se encuentra.
+    """
+    if not isbn or str(isbn).strip() == "":
+        return None
+
+    isbn_limpio = re.sub(r'[^0-9X]', '', str(isbn).upper())
+    if not isbn_limpio:
+        return None
+
+    try:
+        params = {"q": f"isbn:{isbn_limpio}", "maxResults": 1}
+        if GOOGLE_BOOKS_API_KEY:
+            params["key"] = GOOGLE_BOOKS_API_KEY
+
+        resp = requests.get(
+            "https://www.googleapis.com/books/v1/volumes",
+            params=params,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("totalItems", 0) > 0:
+            volume_info = data["items"][0].get("volumeInfo", {})
+            descripcion = volume_info.get("description", "")
+            if descripcion and len(descripcion.strip()) > 20:
+                return limpiar_html(descripcion.strip())
+    except requests.RequestException:
+        pass  # Silenciar errores de red, se intenta con el siguiente nivel
+
+    # Fallback: buscar por título si ISBN no dio resultado
+    if titulo and len(titulo) > 3:
+        try:
+            params = {"q": f"intitle:{titulo}", "maxResults": 1}
+            if GOOGLE_BOOKS_API_KEY:
+                params["key"] = GOOGLE_BOOKS_API_KEY
+
+            resp = requests.get(
+                "https://www.googleapis.com/books/v1/volumes",
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("totalItems", 0) > 0:
+                volume_info = data["items"][0].get("volumeInfo", {})
+                descripcion = volume_info.get("description", "")
+                if descripcion and len(descripcion.strip()) > 20:
+                    return limpiar_html(descripcion.strip())
+        except requests.RequestException:
+            pass
+
+    return None
+
+
+# --- Nivel 2: LM Studio (modelo local, API OpenAI-compatible) ---
+def generar_descripcion_lm_studio(titulo, autor, categoria, idioma):
+    """Genera una descripción de libro usando LM Studio (Qwen 3.5 9B).
+    
+    LM Studio expone una API compatible con OpenAI en /v1/chat/completions.
+    La descripción se genera en el idioma original del libro.
+    Retorna la descripción (str) o None si falla.
+    """
+    instruccion_idioma = IDIOMA_INSTRUCCION.get(idioma, "en español")
+
+    system_msg = (
+        f"Eres un redactor de descripciones de libros. Escribe descripciones comerciales "
+        f"breves y atractivas {instruccion_idioma}. Responde SOLO con la descripción, "
+        f"sin explicaciones, sin comillas, sin prefijos."
+    )
+    user_msg = (
+        f"Genera una descripción comercial breve (2-3 oraciones, máximo 80 palabras) para:\n"
+        f"Título: {titulo}\n"
+        f"Autor: {autor or 'Desconocido'}\n"
+        f"Categoría: {categoria or 'General'}\n"
+        f"NO incluyas el título ni el autor en la descripción."
+    )
+
+    try:
+        resp = requests.post(
+            f"{LM_STUDIO_BASE_URL}/v1/chat/completions",
+            json={
+                "model": LM_STUDIO_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "max_tokens": 500,
+                "stream": False,
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        respuesta = extraer_respuesta_lm(data)
+
+        # Limpiar posibles artefactos del modelo
+        respuesta = re.sub(r'^["\']+|["\']+$', '', respuesta)
+        respuesta = re.sub(r'^(Descripción|Description|Respuesta):\s*', '', respuesta, flags=re.IGNORECASE)
+        respuesta = respuesta.strip()
+
+        if respuesta and len(respuesta) > 20:
+            return respuesta
+    except requests.RequestException as e:
+        tqdm.write(f"   ❌ Error LM Studio: {e}")
+    except (KeyError, IndexError) as e:
+        tqdm.write(f"   ❌ Respuesta inesperada de LM Studio: {e}")
+
+    return None
+
+
+def fase_descripcion(dry_run=False, limit=None):
+    """Fase 2: Rellena descripciones faltantes con Google Books API + LM Studio."""
+    print("\n" + "=" * 60)
+    print("📝 FASE 2: Enriquecimiento de descripciones")
+    print("=" * 60)
+
+    # Consultar libros sin descripción
+    query = """
+        SELECT id, sku, title, author, isbn, category, language
+        FROM books
+        WHERE description IS NULL OR TRIM(description) = ''
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query)).fetchall()
+
+    if not rows:
+        print("   ✅ Todos los libros ya tienen descripción.")
+        return {"total": 0, "google_books": 0, "lm_studio": 0, "sin_descripcion": 0}
+
+    print(f"   → {len(rows)} libros sin descripción")
+
+    # Verificar disponibilidad de LM Studio
+    lm_studio_disponible = False
+    try:
+        resp = requests.get(f"{LM_STUDIO_BASE_URL}/v1/models", timeout=5)
+        if resp.status_code == 200:
+            modelos = [m["id"] for m in resp.json().get("data", [])]
+            lm_studio_disponible = len(modelos) > 0
+            if lm_studio_disponible:
+                print(f"   ✅ LM Studio disponible. Modelos: {', '.join(modelos[:3])}")
+            else:
+                print(f"   ⚠️ LM Studio activo pero sin modelos cargados.")
+    except requests.RequestException:
+        print("   ⚠️ LM Studio no disponible. Solo se usará Google Books API.")
+
+    count_google = 0
+    count_lm_studio = 0
+    count_sin = 0
+    cambios = []
+
+    for row in tqdm(rows, desc="Buscando descripciones"):
+        book_id, sku, titulo, autor, isbn, categoria, idioma = row
+
+        descripcion = None
+        fuente = None
+
+        # Nivel 1: Google Books API
+        descripcion = buscar_google_books(isbn, titulo)
+        if descripcion:
+            fuente = "Google Books"
+            count_google += 1
+        elif lm_studio_disponible:
+            # Nivel 2: LM Studio local (Qwen 3.5 9B)
+            idioma_libro = idioma if es_idioma_valido(idioma) else "Spanish"
+            descripcion = generar_descripcion_lm_studio(titulo, autor, categoria, idioma_libro)
+            if descripcion:
+                fuente = "LM Studio"
+                count_lm_studio += 1
+
+        if descripcion:
+            cambios.append({
+                "id": book_id,
+                "sku": sku,
+                "titulo": titulo,
+                "fuente": fuente,
+                "descripcion": descripcion[:200] + "..." if len(descripcion) > 200 else descripcion,
+                "descripcion_completa": descripcion,
+            })
+        else:
+            count_sin += 1
+
+        # Rate limiting para Google Books API (~1 req/seg para no exceder cuota)
+        time.sleep(0.3)
+
+    # Aplicar cambios
+    if cambios:
+        if dry_run:
+            print(f"\n🔍 DRY-RUN: Se actualizarían {len(cambios)} descripciones:")
+            for c in cambios[:10]:
+                print(f"   [{c['sku']}] ({c['fuente']}) \"{c['titulo'][:40]}\"")
+                print(f"      → {c['descripcion'][:100]}...")
+            if len(cambios) > 10:
+                print(f"   ... y {len(cambios) - 10} más")
+        else:
+            print(f"\n💾 Guardando {len(cambios)} descripciones en la BD...")
+            with engine.begin() as conn:
+                sql = text("UPDATE books SET description = :desc WHERE id = :id")
+                lote = []
+                for i, c in enumerate(cambios):
+                    lote.append({"desc": c["descripcion_completa"], "id": c["id"]})
+                    if (i + 1) % 50 == 0:
+                        conn.execute(sql, lote)
+                        lote.clear()
+                if lote:
+                    conn.execute(sql, lote)
+            print("   ✅ Descripciones actualizadas correctamente.")
+
+    stats = {
+        "total": len(rows),
+        "google_books": count_google,
+        "lm_studio": count_lm_studio,
+        "sin_descripcion": count_sin,
+    }
+    print(f"\n📊 Fase 2: {count_google} Google Books + {count_lm_studio} LM Studio = {count_google + count_lm_studio} enriquecidos")
+    if count_sin > 0:
+        print(f"   ⚠️ {count_sin} libros quedaron sin descripción")
+    return stats
+
+
+# =====================================================
+# Main
+# =====================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Enriquecimiento del catálogo de libros (idioma + descripciones)"
+    )
+    parser.add_argument(
+        "--phase",
+        choices=["language", "description", "all"],
+        default="all",
+        help="Fase a ejecutar: 'language' (solo idioma), 'description' (solo descripciones), 'all' (ambas)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Modo preview: muestra cambios sin modificar la BD",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limitar a N libros (útil para pruebas)",
+    )
+    args = parser.parse_args()
+
+    print("🚀 Iniciando enriquecimiento del catálogo de libros")
+    print(f"   Modo: {'DRY-RUN (sin cambios en BD)' if args.dry_run else 'PRODUCCIÓN (cambios reales)'}")
+    print(f"   Fase: {args.phase}")
+    if args.limit:
+        print(f"   Límite: {args.limit} libros")
+
+    stats = {}
+
+    if args.phase in ("language", "all"):
+        stats["idioma"] = fase_idioma(dry_run=args.dry_run, limit=args.limit)
+
+    if args.phase in ("description", "all"):
+        stats["descripcion"] = fase_descripcion(dry_run=args.dry_run, limit=args.limit)
+
+    # Resumen final
+    print("\n" + "=" * 60)
+    print("✅ RESUMEN FINAL")
+    print("=" * 60)
+    if "idioma" in stats:
+        s = stats["idioma"]
+        total_ok = s['lingua'] + s['lm_studio']
+        print(f"   Idiomas:       {s['lingua']} lingua + {s['lm_studio']} LM Studio = {total_ok}/{s['total']} ({s['no_detectados']} sin detectar)")
+    if "descripcion" in stats:
+        s = stats["descripcion"]
+        print(f"   Descripciones: {s['google_books']} Google Books + {s['lm_studio']} LM Studio / {s['total']} total")
+        print(f"                  {s['sin_descripcion']} quedaron sin descripción")
+
+
+if __name__ == "__main__":
+    main()
