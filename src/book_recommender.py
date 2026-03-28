@@ -1,4 +1,5 @@
 import pandas as pd
+import hashlib
 from sqlalchemy import create_engine, text
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
@@ -365,7 +366,7 @@ tfidf_matrix = vectorizer.fit_transform(df['Texto_IA'])
 # 5. Entrenar modelo NearestNeighbors
 #
 # En vez de calcular la similitud coseno de CADA libro contra TODOS los
-# demás (O(n²) = ~93 millones de comparaciones para 9674 libros),
+# demás (O(n²), crece cuadráticamente con el catálogo),
 # NearestNeighbors pre-indexa los vectores y busca solo los K vecinos
 # más cercanos de forma optimizada, reduciendo drásticamente el tiempo.
 # =====================================================
@@ -484,3 +485,41 @@ try:
 
 except Exception as e:
     print(f"Error durante el procesamiento/guardado: {e}")
+
+# =====================================================
+# 7. Exportación del Dataset de Entrada
+# =====================================================
+print("7. Generando dataset de entrada anonimizado...")
+
+def hashear_sku(sku, salt="=]&Roy%!?vK8"):
+    """
+    Convierte un SKU real en un hash SHA-256 irreversible.
+    Asegurarse de cambiar el 'salt' por una cadena única del entorno.
+    """
+    texto_a_hashear = f"{str(sku).strip()}_{salt}".encode('utf-8')
+    hash_completo = hashlib.sha256(texto_a_hashear).hexdigest()
+    return hash_completo[:16] 
+
+# Usamos una copia del DataFrame principal (df) de los textos procesados
+df_kaggle = df.copy()
+
+# Generación la nueva columna con los SKUs ofuscados
+df_kaggle['sku_anonimo'] = df_kaggle['sku'].apply(hashear_sku)
+
+# Filtrar estrictamente las columnas que son públicas y útiles para NLP
+columnas_seguras = [
+    'sku_anonimo', 
+    'title', 
+    'author', 
+    'grupo_categoria', 
+    'language', 
+    'Texto_IA_Limpio' 
+]
+
+df_export = df_kaggle[columnas_seguras]
+
+# Exportación del archivo CSV final
+nombre_archivo = 'book_catalog_features_kaggle.csv'
+df_export.to_csv(nombre_archivo, index=False)
+
+print(f"¡Dataset generado con éxito: {nombre_archivo}!")
