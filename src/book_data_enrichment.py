@@ -1,18 +1,20 @@
 """
 Script de Enriquecimiento del Catálogo de Libros
 =================================================
-Enriquece la base de datos de libros en tres fases:
-  Fase 1: Detecta/corrige el idioma usando la librería lingua (offline).
+Enriquece y consolida la base de datos de libros mediante fases escalonadas:
+  Fase 1: Detecta/corrige el idioma usando la librería lingua (offline/llm fallback).
   Fase 2: Rellena descripciones faltantes usando Google Books API + LM Studio local.
-  Fase 3: Normaliza autores existentes y rellena autores NULL (Google Books + LM Studio).
+  Fase 2.5: Convierte las descripciones guardadas en texto plano a formato HTML rico.
+  Fase 3: Normaliza autores y rellena NULLs tratando separadores estrictamente estructurados.
 
 Uso:
-  python -m src.book_data_enrichment                           # Ejecutar todo
-  python -m src.book_data_enrichment --phase language           # Solo idiomas
-  python -m src.book_data_enrichment --phase description        # Solo descripciones
-  python -m src.book_data_enrichment --phase author             # Solo autores
-  python -m src.book_data_enrichment --dry-run                  # Preview sin escribir BD
-  python -m src.book_data_enrichment --limit 20 --dry-run       # Solo 20 libros, preview
+  python -m src.book_data_enrichment                           # Ejecutar todas las fases secuenciales
+  python -m src.book_data_enrichment --phase language           # Solo detección de idiomas
+  python -m src.book_data_enrichment --phase description        # Solo generación de descripciones
+  python -m src.book_data_enrichment --phase format_html        # Solo conversión a HTML
+  python -m src.book_data_enrichment --phase author             # Solo normalización de autores
+  python -m src.book_data_enrichment --dry-run                  # Preview de cambios sin escribir BD
+  python -m src.book_data_enrichment --limit 20 --dry-run       # Preview rapida con primeros 20 libros
 """
 
 import argparse
@@ -86,6 +88,37 @@ IDIOMA_INSTRUCCION = {
 def limpiar_html(texto):
     """Elimina etiquetas HTML de un texto."""
     return re.sub(r'<[^>]+>', ' ', str(texto)).strip()
+
+
+def convertir_a_html_legible(texto):
+    """Convierte texto plano en un formato HTML legible con párrafos y primera oración en negrita.
+    Si ya contiene HTML (e.g., <p>), devuelve el texto intacto.
+    """
+    if not isinstance(texto, str) or not texto.strip():
+        return ""
+        
+    # Validar si ya es HTML (contiene etiquetas estructurales)
+    if '<p' in texto.lower() or '<b' in texto.lower() or '<strong' in texto.lower():
+        return texto.strip()
+
+    texto = re.sub(r'\s+', ' ', texto.strip())
+    oraciones = re.split(r'(?<=[.!?]) +', texto)
+    oraciones = [o.strip() for o in oraciones if o.strip()]
+    if not oraciones:
+        return ""
+    if len(oraciones) == 1:
+        return f"<p>{oraciones[0]}</p>"
+        
+    html_final = f"<p><strong>{oraciones[0]}</strong></p>\n"
+    parrafo_actual = []
+    for oracion in oraciones[1:]:
+        parrafo_actual.append(oracion)
+        if len(parrafo_actual) == 3:
+            html_final += f"<p>{' '.join(parrafo_actual)}</p>\n"
+            parrafo_actual = []
+    if parrafo_actual:
+        html_final += f"<p>{' '.join(parrafo_actual)}</p>"
+    return html_final
 
 
 def es_idioma_valido(idioma):
@@ -503,13 +536,15 @@ def fase_descripcion(dry_run=False, limit=None):
                 count_lm_studio += 1
 
         if descripcion:
+            # Aplicamos formato HTML antes de guardar si la fase formatea automático
+            descripcion_html = convertir_a_html_legible(descripcion)
             cambios.append({
                 "id": book_id,
                 "sku": sku,
                 "titulo": titulo,
                 "fuente": fuente,
                 "descripcion": descripcion[:200] + "..." if len(descripcion) > 200 else descripcion,
-                "descripcion_completa": descripcion,
+                "descripcion_completa": descripcion_html,
             })
         else:
             count_sin += 1
@@ -553,6 +588,69 @@ def fase_descripcion(dry_run=False, limit=None):
 
 
 # =====================================================
+# FASE 2.5: Formato HTML
+# =====================================================
+def fase_formato_html(dry_run=False, limit=None):
+    """Fase intermidia: Convierte a HTML todas las descripciones en BD que sean texto plano."""
+    print("\n" + "=" * 60)
+    print("🎨 FASE 2.5: Conversión a HTML de descripciones")
+    print("=" * 60)
+
+    # Consultar libros con descripción pero sin formato HTML
+    query = """
+        SELECT id, sku, title, description
+        FROM books
+        WHERE description IS NOT NULL 
+          AND TRIM(description) != '' 
+          AND description NOT LIKE '%<p>%'
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query)).fetchall()
+
+    if not rows:
+        print("   ✅ Todas las descripciones ya tienen formato HTML o no hay descripciones para procesar.")
+        return {"total": 0, "formateados": 0}
+
+    print(f"   → {len(rows)} descripciones necesitan formato HTML")
+
+    cambios = []
+    for row in tqdm(rows, desc="Convirtiendo a HTML"):
+        book_id, sku, titulo, desc_actual = row
+        desc_html = convertir_a_html_legible(desc_actual)
+        if desc_html and desc_html != desc_actual:
+            cambios.append({"id": book_id, "sku": sku, "titulo": titulo, "html": desc_html})
+
+    if cambios:
+        if dry_run:
+            print(f"\n🔍 DRY-RUN: Se formatearían {len(cambios)} descripciones:")
+            for c in cambios[:10]:
+                print(f"   [{c['sku']}] \"{c['titulo'][:40]}\"")
+                print(f"      → {c['html'][:80]}...")
+            if len(cambios) > 10:
+                print(f"   ... y {len(cambios) - 10} más")
+        else:
+            print(f"\n💾 Guardando {len(cambios)} descripciones en formato HTML...")
+            with engine.begin() as conn:
+                sql = text("UPDATE books SET description = :html WHERE id = :id")
+                lote = []
+                for i, c in enumerate(cambios):
+                    lote.append({"html": c["html"], "id": c["id"]})
+                    if (i + 1) % 50 == 0:
+                        conn.execute(sql, lote)
+                        lote.clear()
+                if lote:
+                    conn.execute(sql, lote)
+            print("   ✅ Descripciones formateadas correctamente.")
+            
+    stats = {"total": len(rows), "formateados": len(cambios)}
+    print(f"\n📊 Fase 2.5: {len(cambios)}/{len(rows)} descripciones convertidas a HTML")
+    return stats
+
+
+# =====================================================
 # FASE 3: Enriquecimiento de autores
 # =====================================================
 
@@ -572,6 +670,10 @@ CREDENCIALES = {
     "sir", "dame", "capt", "col", "gen", "sgt",
 }
 
+# Nombres o entidades que son ruido y deben eliminarse por completo
+JUNK_AUTHORS = {"unknown", "anonymous", "varios", "various", "n/a", "none", "various artists", "not available"}
+CORP_WORDS = {"ltd", "ltd.", "inc", "co", "publishing", "press", "books", "company", "publications", "llc", "s.a."}
+
 
 def normalizar_autor_individual(autor_str):
     """Normaliza un solo autor (sin delimitadores de múltiples autores).
@@ -589,23 +691,15 @@ def normalizar_autor_individual(autor_str):
     if not texto:
         return ""
 
+    if texto.lower() in JUNK_AUTHORS:
+        return ""
+
     # Eliminar apodos entre comillas (ej. "Goose", 'Ace')
     texto = re.sub(r'["\']([^"\']+)["\']', '', texto)
 
-    # Si tiene formato "Last, First" (exactamente una coma)
-    partes_coma = [p.strip() for p in texto.split(",")]
-    if len(partes_coma) == 2:
-        # Detectar si la primera parte es un sufijo (ej. "Jr., Clifton Collins")
-        if partes_coma[0].lower().rstrip(".") in {s.rstrip(".") for s in SUFIJOS_NOMBRE}:
-            # "Jr., Clifton Collins" → sufijo=Jr., nombre=Clifton Collins
-            sufijo = partes_coma[0].strip()
-            texto = f"{partes_coma[1].strip()} {sufijo}"
-        else:
-            # "Collins, Clifton" → "Clifton Collins"
-            texto = f"{partes_coma[1]} {partes_coma[0]}"
-    elif len(partes_coma) > 2:
-        # Múltiples comas: intentar reconstruir (poco común en autor individual)
-        texto = " ".join(partes_coma)
+    # Ya no intentamos invertir "Last, First" aquí porque al no ser un LLM
+    # no tenemos contexto semántico para distinguir "Apellido, Nombre" de "Autor, Editorial".
+    # Las comas se manejarán exclusivamente como separadores de autores en normalizar_autor().
 
     # Separar en tokens para filtrar credenciales y detectar sufijos sueltos
     tokens = texto.split()
@@ -646,13 +740,13 @@ def normalizar_autor_individual(autor_str):
 
 
 def normalizar_autor(autor_raw):
-    """Normaliza un string de autores (puede contener múltiples separados por |).
+    """Normaliza un string de autores (puede contener múltiples separados por | o comas).
 
     Formato estándar resultante:
     - Orden: Nombre Apellido (no Apellido, Nombre)
     - Title Case
     - Sin credenciales ni apodos
-    - Múltiples autores separados por ', '
+    - Múltiples autores separados por '; '
     - Sin duplicados
 
     Retorna el string normalizado o None si no queda nada útil.
@@ -660,14 +754,21 @@ def normalizar_autor(autor_raw):
     if not autor_raw or str(autor_raw).strip() == "":
         return None
 
-    # Split por | (separador principal de múltiples autores en los datos)
-    autores_raw = str(autor_raw).split("|")
+    texto_raw = str(autor_raw).strip()
+    
+    # Unificamos separadores: reemplazamos pipes por comas para tener un único delimitador
+    texto_raw = texto_raw.replace("|", ",")
+    
+    # Separamos asumiendo que TODA coma delimita entidades independientes
+    # (WooCommerce exporta así las taxonomías múltiples).
+    autores_raw = [a.strip() for a in texto_raw.split(",") if a.strip()]
+
     autores_normalizados = []
     vistos = set()  # Para deduplicar (case-insensitive)
 
     for autor in autores_raw:
         normalizado = normalizar_autor_individual(autor)
-        if normalizado:
+        if normalizado and normalizado.lower().strip() not in JUNK_AUTHORS:
             clave = normalizado.lower()
             if clave not in vistos:
                 vistos.add(clave)
@@ -676,6 +777,7 @@ def normalizar_autor(autor_raw):
     if not autores_normalizados:
         return None
 
+    # Volvemos a usar la coma como piden los specs del backend (el backend lo parsea como array)
     return ", ".join(autores_normalizados)
 
 
@@ -958,13 +1060,13 @@ def fase_autor(dry_run=False, limit=None):
 # =====================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Enriquecimiento del catálogo de libros (idioma + descripciones + autores)"
+        description="Enriquecimiento del catálogo de libros (idioma + descripciones + html + autores)"
     )
     parser.add_argument(
         "--phase",
-        choices=["language", "description", "author", "all"],
+        choices=["language", "description", "format_html", "author", "all"],
         default="all",
-        help="Fase a ejecutar: 'language', 'description', 'author', o 'all' (las tres)",
+        help="Fase a ejecutar: 'language', 'description', 'format_html', 'author', o 'all' (por defecto)",
     )
     parser.add_argument(
         "--dry-run",
@@ -992,6 +1094,9 @@ def main():
 
     if args.phase in ("description", "all"):
         stats["descripcion"] = fase_descripcion(dry_run=args.dry_run, limit=args.limit)
+        
+    if args.phase in ("format_html", "all"):
+        stats["format_html"] = fase_formato_html(dry_run=args.dry_run, limit=args.limit)
 
     if args.phase in ("author", "all"):
         stats["autor"] = fase_autor(dry_run=args.dry_run, limit=args.limit)
@@ -1008,6 +1113,9 @@ def main():
         s = stats["descripcion"]
         print(f"   Descripciones: {s['google_books']} Google Books + {s['lm_studio']} LM Studio / {s['total']} total")
         print(f"                  {s['sin_descripcion']} quedaron sin descripción")
+    if "format_html" in stats:
+        s = stats["format_html"]
+        print(f"   Formato HTML:  {s['formateados']}/{s['total']} descripciones convertidas a HTML")
     if "autor" in stats:
         s = stats["autor"]
         print(f"   Autores:       {s['total_normalizados']}/{s['total_existentes']} normalizados")
