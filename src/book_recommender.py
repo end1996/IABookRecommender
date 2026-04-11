@@ -20,8 +20,9 @@ engine = create_engine(DB_URL)
 # Configuración del modelo
 # =====================================================
 # Score mínimo para aceptar una recomendación (debajo de esto se descarta).
-# Un valor muy bajo (0.01) permite cubrir libros con pocos candidatos elegibles.
-UMBRAL_SIMILITUD_MINIMA = 0.01
+# Un valor de 0.10 filtra recomendaciones relleno que solo comparten idioma
+# sin afinidad real por contenido ni categoría.
+UMBRAL_SIMILITUD_MINIMA = 0.10
 
 # Pesos del score compuesto. Deben sumar 1.0.
 # La categoría tiene peso alto (0.45) porque es la señal más confiable
@@ -70,6 +71,12 @@ STOPWORDS_ESPANOL = [
     'primer', 'primera', 'mejor', 'manera', 'forma', 'parte', 'tiempo',
     'lugar', 'cada', 'través', 'cuenta', 'hombre', 'mujer',
     'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete', 'ocho', 'nueve', 'diez',
+    # Palabras genéricas que aparecen en infantil, juvenil y ficción sin
+    # discriminar entre ellas. Filtrarlas mejora la separación de categorías
+    # adyacentes (infantil vs juvenil) en el espacio TF-IDF.
+    'pequeño', 'pequeña', 'pequeños', 'pequeñas', 'niño', 'niña', 'niños',
+    'niñas', 'aventura', 'aventuras', 'divertido', 'divertida', 'amigos',
+    'familia', 'escuela', 'joven', 'jóvenes', 'perfecto', 'perfecta',
 ]
 
 STOPWORDS_INGLES = [
@@ -95,6 +102,11 @@ STOPWORDS_INGLES = [
     'world', 'life', 'year', 'years', 'man', 'woman', 'day', 'days',
     'many', 'much', 'well', 'back', 'even', 'also', 'made', 'make',
     'like', 'set', 'part', 'long', 'find', 'work', 'come', 'take',
+    # Palabras genéricas infantil/juvenil/ficción que no discriminan entre
+    # categorías adyacentes y contaminan el espacio TF-IDF.
+    'fun', 'little', 'perfect', 'children', 'young', 'kids', 'readers',
+    'love', 'family', 'friends', 'school', 'adventure', 'join', 'old',
+    'best', 'people', 'never', 'help', 'favorite', 'learn', 'play',
 ]
 
 # Se combinan ambas listas para alimentar el TfidfVectorizer
@@ -201,7 +213,9 @@ def limpiar_html(texto):
 def extraer_titulo_base(titulo):
     """Extrae el título base de un libro para detectar duplicados (distintas ediciones)."""
     t = str(titulo).lower().strip()
-    t = re.split(r'[:\-—]|\bpor\b|\bby\b', t)[0]
+    # Normalizar entidades HTML que vienen de WooCommerce (ej. &amp; → &)
+    t = t.replace('&amp;', '&').replace('&#39;', "'").replace('&quot;', '"')
+    t = re.split(r':| - | — |!|\?|\(|\bpor\b|\bby\b', t)[0]
     t = re.sub(r'^(the|a|an|el|la|los|las|un|una)\s+', '', t.strip())
     t = re.sub(r',\s*(the|a|an|el|la|los|las|un|una)$', '', t.strip())
     t = re.sub(r'[^\w\s]', '', t)
@@ -459,11 +473,20 @@ try:
                 if score_final < UMBRAL_SIMILITUD_MINIMA:
                     continue
 
-                candidatos.append((lista_ids[i], score_final))
+                candidatos.append((lista_ids[i], score_final, i))
 
             # Ordenar por score compuesto descendente y seleccionar los mejores
             candidatos.sort(key=lambda x: x[1], reverse=True)
-            recomendados = candidatos[:CANTIDAD_RECOMENDACIONES]
+            recomendados = []
+            titulos_vistos = set()
+            
+            for rec_sku, score, rec_idx in candidatos:
+                t_base = titulos_base[rec_idx]
+                if t_base not in titulos_vistos:
+                    titulos_vistos.add(t_base)
+                    recomendados.append((rec_sku, score))
+                    if len(recomendados) == CANTIDAD_RECOMENDACIONES:
+                        break
 
             if len(recomendados) == 0:
                 libros_sin_recs += 1
