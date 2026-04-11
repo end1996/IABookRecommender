@@ -1056,17 +1056,257 @@ def fase_autor(dry_run=False, limit=None):
 
 
 # =====================================================
+# FASE 4: Enriquecimiento de Tags (Subjects)
+# =====================================================
+
+TAGS_PERMITIDOS_ES = [
+    "Ficción General", "Ficción Histórica", "Ciencia Ficción", "Fantasía", "Terror", 
+    "Romance", "Thriller y Misterio", "Cómics y Manga", "Poesía y Teatro", "Humor",
+    "Historia", "Biografías y Memorias", "Música", "Filosofía", "Religión y Espiritualidad", 
+    "Ciencia", "Tecnología e Informática", "Arte y Fotografía", "Diseño", "Ensayo y Crítica", 
+    "Desarrollo Personal", "Negocios y Economía", "Salud y Bienestar", "Belleza y Cuidado Personal",
+    "Cocina y Gastronomía", "Viajes y Turismo", "Ocio y Hobbies", "Animales y Naturaleza",
+    "Infantil", "Cuentos y Fábulas", "Juvenil (Young Adult)", "Material Didáctico", "Educación", 
+    "Derecho y Política", "Militar y Guerra", "Hogar y Jardinería", "Manualidades",
+]
+
+TAGS_PERMITIDOS_EN = [
+    "General Fiction", "Historical Fiction", "Science Fiction", "Fantasy", "Horror", 
+    "Romance", "Thriller & Mystery", "Comics & Manga", "Poetry & Drama", "Humor",
+    "History", "Biographies & Memoirs", "Music", "Philosophy", "Religion & Spirituality", 
+    "Science", "Technology & Computing", "Art & Photography", "Design", "Essays & Criticism", 
+    "Self-Help", "Business & Economics", "Health & Wellness", "Beauty & Grooming",
+    "Cooking & Gastronomy", "Travel & Tourism", "Leisure & Hobbies", "Animals & Nature",
+    "Children's", "Fables & Fairy Tales", "Young Adult", "Educational Material", "Education", 
+    "Law & Politics", "Home & Garden", "Military", "Crafts",
+]
+
+def obtener_prompt_tags(idioma):
+    """Devuelve el system prompt, user prompt pre-formateado y lista de tags."""
+    if idioma == "English":
+        tags = TAGS_PERMITIDOS_EN
+        sys_msg = (
+            "You are an expert librarian and an automated catalog enrichment system.\n"
+            "Your task is to analyze the description of a book and assign between 1 and 3 precise thematic tags.\n\n"
+            "<reglas_criticas>\n"
+            "1. ONLY select tags from the permitted list. DO NOT use your own knowledge to invent tags.\n"
+            "2. If no tag in the list is a perfect match, select the closest related tag(s) or 'General Fiction'.\n"
+            "3. NO explanations, NO intro, NO conversational text. The output MUST be ONLY a valid JSON array.\n"
+            "4. Do NOT use markdown code blocks (```json).\n"
+            "</reglas_criticas>\n\n"
+            "<lista_permitida>\n"
+            "{lista_tags}\n"
+            "</lista_permitida>\n\n"
+            "Correct output example:\n"
+            '["Science Fiction", "Technology & Computing"]\n'
+        )
+        user_prompt = "Analyze the following book description and generate the JSON array with the corresponding tags:\n\n{descripcion}"
+    else:
+        tags = TAGS_PERMITIDOS_ES
+        sys_msg = (
+            "Eres un bibliotecario experto y un sistema de enriquecimiento de catálogo automatizado.\n"
+            "Tu tarea es analizar la descripción de un libro y asignarle entre 1 y 3 etiquetas temáticas precisas.\n\n"
+            "<reglas_criticas>\n"
+            "1. SOLO puedes seleccionar etiquetas de la lista permitida. NO inventes categorías nuevas aunque creas que son mejores.\n"
+            "2. Si ninguna etiqueta de la lista parece encajar perfectamente, elegí la más cercana o 'Ficción General'.\n"
+            "3. NO des explicaciones, NO hables, NO agregues introducciones. La salida debe ser ÚNICAMENTE un arreglo JSON válido.\n"
+            "4. No utilices bloques de código markdown (```json).\n"
+            "</reglas_criticas>\n\n"
+            "<lista_permitida>\n"
+            "{lista_tags}\n"
+            "</lista_permitida>\n\n"
+            "Ejemplo de salida correcta:\n"
+            '["Ciencia Ficción", "Tecnología e Informática"]\n'
+        )
+        user_prompt = "Analiza la siguiente descripción del libro y genera el arreglo JSON con las etiquetas correspondientes:\n\n{descripcion}"
+        
+    lista_tags_formateada = "\n".join(f"- {tag}" for tag in tags)
+    sys_msg = sys_msg.replace("{lista_tags}", lista_tags_formateada)
+    
+    return sys_msg, user_prompt, tags
+
+
+def generar_tags_lm_studio(descripcion, idioma):
+    """Genera tags temáticos para una descripción usando LM Studio.
+    
+    Retorna una lista de strings con los tags oficiales, o None si falla.
+    """
+    if not descripcion or len(str(descripcion).strip()) < 20:
+        return None
+        
+    if not isinstance(idioma, str):
+        idioma = "Spanish"
+        
+    sys_msg, user_prompt_template, tags_oficiales = obtener_prompt_tags(idioma)
+    user_msg = user_prompt_template.replace("{descripcion}", str(descripcion).strip())
+    
+    try:
+        resp = requests.post(
+            f"{LM_STUDIO_BASE_URL}/v1/chat/completions",
+            json={
+                "model": LM_STUDIO_MODEL,
+                "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "temperature": 0.1,  # Muy baja temperatura para asegurar determinismo
+                "max_tokens": 150,
+                "stream": False,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        respuesta_raw = extraer_respuesta_lm(data).strip()
+        
+        # Limpieza robusta: buscar el primer [ y el último ] para extraer solo el JSON
+        match = re.search(r'\[.*\]', respuesta_raw, re.DOTALL)
+        if not match:
+            # tqdm.write(f"   ⚠️ El modelo no devolvió un formato de lista válido.")
+            return None
+            
+        respuesta_json = match.group(0)
+        
+        # Intentar parsear como lista JSON
+        try:
+            tags_devueltos = json.loads(respuesta_json)
+            if isinstance(tags_devueltos, list):
+                # Filtrar estrictamente contra la lista oficial
+                tags_filtrados = [tag.strip() for tag in tags_devueltos if tag.strip() in tags_oficiales]
+                
+                # Reportar tags alucinados (que no están en la lista oficial)
+                tags_alucinados = [tag.strip() for tag in tags_devueltos if tag.strip() not in tags_oficiales]
+                if tags_alucinados and not tags_filtrados:
+                    # Si todos los tags eran alucinados, avisar
+                    # tqdm.write(f"   ⚠️ Tags ignorados (fuera de lista): {', '.join(tags_alucinados)}")
+                    pass
+                
+                if tags_filtrados:
+                    # Eliminar duplicados manteniendo orden
+                    return list(dict.fromkeys(tags_filtrados))
+        except json.JSONDecodeError:
+            tqdm.write(f"   ❌ Error parseando JSON de LM Studio. Respuesta raw: {respuesta_raw[:100]}...")
+            
+    except requests.RequestException as e:
+        tqdm.write(f"   ❌ Error API LM Studio en tags: {e}")
+    except Exception as e:
+        tqdm.write(f"   ❌ Error inesperado: {e}")
+        
+    return None
+
+
+def fase_tags(dry_run=False, limit=None):
+    """Fase 4: Asigna tags (subjects) a libros usando el modelo Qwen (LM Studio).
+    
+    Solo procesa libros que tengan descripción y no tengan subjects.
+    """
+    print("\n" + "=" * 60)
+    print("🏷️  FASE 4: Enriquecimiento de Tags (Subjects)")
+    print("=" * 60)
+    
+    # Consultar libros sin tags pero CON descripción
+    query = """
+        SELECT id, sku, title, description, language
+        FROM books
+        WHERE (subjects IS NULL OR TRIM(subjects) = '')
+          AND description IS NOT NULL AND TRIM(description) != ''
+    """
+    if limit:
+        query += f" LIMIT {int(limit)}"
+        
+    with engine.connect() as conn:
+        rows = conn.execute(text(query)).fetchall()
+        
+    if not rows:
+        print("   ✅ No hay libros con descripción que necesiten tags.")
+        return {"total": 0, "lm_studio": 0, "sin_tags": 0}
+        
+    print(f"   → {len(rows)} libros necesitan tags")
+    
+    # Verificar disponibilidad de LM Studio
+    lm_studio_disponible = False
+    try:
+        resp = requests.get(f"{LM_STUDIO_BASE_URL}/v1/models", timeout=5)
+        if resp.status_code == 200:
+            lm_studio_disponible = len(resp.json().get("data", [])) > 0
+    except requests.RequestException:
+        pass
+        
+    if not lm_studio_disponible:
+        print("   ❌ LM Studio no está disponible. Esta fase requiere un LLM local.")
+        return {"total": len(rows), "lm_studio": 0, "sin_tags": len(rows)}
+        
+    print("   ✅ LM Studio disponible. Comenzando asignación de tags...")
+    
+    count_tags = 0
+    count_sin = 0
+    cambios = []
+    
+    for row in tqdm(rows, desc="Procesando tags"):
+        book_id, sku, titulo, descripcion, idioma = row
+        
+        # Extraer texto limpio de la descripción
+        desc_limpia = limpiar_html(descripcion)
+        
+        tags_generados = generar_tags_lm_studio(desc_limpia, idioma)
+        
+        if tags_generados:
+            # En MySQL almacenamos separado por comas
+            tags_str = ", ".join(tags_generados)
+            cambios.append({
+                "id": book_id,
+                "sku": sku,
+                "titulo": titulo,
+                "tags": tags_str
+            })
+            count_tags += 1
+        else:
+            count_sin += 1
+            
+    # Aplicar cambios
+    if cambios:
+        if dry_run:
+            print(f"\n🔍 DRY-RUN: Se generarían tags para {len(cambios)} libros:")
+            for c in cambios[:15]:
+                print(f"   [{c['sku']}] \"{c['titulo'][:40]}\"")
+                print(f"      🏷️  {c['tags']}")
+            if len(cambios) > 15:
+                print(f"   ... y {len(cambios) - 15} más")
+        else:
+            print(f"\n💾 Guardando {len(cambios)} sets de tags...")
+            with engine.begin() as conn:
+                sql = text("UPDATE books SET subjects = :tags WHERE id = :id")
+                lote = []
+                for i, c in enumerate(cambios):
+                    lote.append({"tags": c["tags"], "id": c["id"]})
+                    if (i + 1) % 50 == 0:
+                        conn.execute(sql, lote)
+                        lote.clear()
+                if lote:
+                    conn.execute(sql, lote)
+            print("   ✅ Tags guardados correctamente.")
+            
+    stats = {
+        "total": len(rows),
+        "lm_studio": count_tags,
+        "sin_tags": count_sin,
+    }
+    print(f"\n📊 Fase 4: {count_tags} enriquecidos | {count_sin} sin resolver")
+    return stats
+
+
+# =====================================================
 # Main
 # =====================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Enriquecimiento del catálogo de libros (idioma + descripciones + html + autores)"
+        description="Enriquecimiento del catálogo de libros (idioma + descripciones + html + autores + tags)"
     )
     parser.add_argument(
         "--phase",
-        choices=["language", "description", "format_html", "author", "all"],
+        choices=["language", "description", "format_html", "author", "tags", "all"],
         default="all",
-        help="Fase a ejecutar: 'language', 'description', 'format_html', 'author', o 'all' (por defecto)",
+        help="Fase a ejecutar: 'language', 'description', 'format_html', 'author', 'tags' o 'all' (por defecto)",
     )
     parser.add_argument(
         "--dry-run",
@@ -1101,6 +1341,9 @@ def main():
     if args.phase in ("author", "all"):
         stats["autor"] = fase_autor(dry_run=args.dry_run, limit=args.limit)
 
+    if args.phase in ("tags", "all"):
+        stats["tags"] = fase_tags(dry_run=args.dry_run, limit=args.limit)
+
     # Resumen final
     print("\n" + "=" * 60)
     print("✅ RESUMEN FINAL")
@@ -1122,6 +1365,11 @@ def main():
         print(f"                  {s['google_books']} Google Books + {s['lm_studio']} LM Studio / {s['total_nulls']} NULLs")
         if s['sin_autor'] > 0:
             print(f"                  {s['sin_autor']} quedaron sin autor")
+    if "tags" in stats:
+        s = stats["tags"]
+        print(f"   Tags:          {s['lm_studio']}/{s['total']} libros enriquecidos con tags")
+        if s['sin_tags'] > 0:
+            print(f"                  {s['sin_tags']} quedaron sin tags resolubles")
 
 
 if __name__ == "__main__":
