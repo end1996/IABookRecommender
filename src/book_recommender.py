@@ -358,7 +358,12 @@ vectorizer = TfidfVectorizer(
     stop_words=STOPWORDS_BILINGUE,
     ngram_range=(1, 2),  # Captura unigramas y bigramas (ej. "guerra civil", "amor prohibido")
     sublinear_tf=True,   # Aplica log(1 + tf), reduce impacto de palabras muy repetidas
-    max_features=50000   # Limita el vocabulario para controlar uso de memoria
+    max_features=50000,  # Limita el vocabulario para controlar uso de memoria
+    # Exige que cada token EMPIECE con una letra, descartando tokens numéricos
+    # o con prefijo numérico ('000', '100th', '1000stickers') que vienen de
+    # marketing y no aportan señal discriminativa entre géneros.
+    token_pattern=r'(?u)\b[a-zA-ZáéíóúñüÀ-ÿ]\w+\b'
+
 )
 tfidf_matrix = vectorizer.fit_transform(df['Texto_IA'])
 
