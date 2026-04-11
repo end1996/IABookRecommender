@@ -77,6 +77,8 @@ STOPWORDS_ESPANOL = [
     'pequeño', 'pequeña', 'pequeños', 'pequeñas', 'niño', 'niña', 'niños',
     'niñas', 'aventura', 'aventuras', 'divertido', 'divertida', 'amigos',
     'familia', 'escuela', 'joven', 'jóvenes', 'perfecto', 'perfecta',
+    # Términos comerciales y de marketing (ruido)
+    'derechos', 'reservados', 'bestseller', 'impreso',
 ]
 
 STOPWORDS_INGLES = [
@@ -107,6 +109,9 @@ STOPWORDS_INGLES = [
     'fun', 'little', 'perfect', 'children', 'young', 'kids', 'readers',
     'love', 'family', 'friends', 'school', 'adventure', 'join', 'old',
     'best', 'people', 'never', 'help', 'favorite', 'learn', 'play',
+    # Corporate noise and marketing
+    'ltd', 'inc', 'llc', 'press', 'publishing', 'rights', 'reserved',
+    'bestselling', 'bestseller', 'york', 'times', 'big', 'copyright',
 ]
 
 # Se combinan ambas listas para alimentar el TfidfVectorizer
@@ -208,6 +213,37 @@ CATEGORIAS_RUIDO = [
 def limpiar_html(texto):
     """Elimina etiquetas HTML de las descripciones (ej. <p>, <br>, <strong>)."""
     return re.sub(r'<[^>]+>', ' ', str(texto))
+
+
+def limpiar_marketing(texto):
+    """Vuela firmas corporativas y sellos literarios ('New York Times Bestseller')."""
+    t = str(texto)
+    # Volar "New York Times Bestselling Author" o "#1 Bestseller"
+    t = re.sub(r'(?i)(new\s*york\s*times|#1|national)?\s*bestsell(er|ing)\s*(author|book)?', ' ', t)
+    # Volar derechos de autor genéricos y fechas sueltas de copyright
+    t = re.sub(r'(?i)copyright.*?\d{4}', ' ', t)
+    return t
+
+
+def remover_autor_de_descripcion(desc, author_raw):
+    """Remueve dinámicamente el nombre del autor de la descripción para evitar overfitting."""
+    if not author_raw or str(author_raw).strip() == '':
+        return desc
+    
+    desc_limpia = str(desc)
+    # Separar autores si hay múltiples ("Collins, Clifton", etc)
+    partes = re.split(SEPARADORES_AUTORES, str(author_raw))
+    for a in partes:
+        # Limpiar el nombre de puntuaciones
+        a_limpio = re.sub(r'[^\w\s]', '', a).strip()
+        if not a_limpio:
+            continue
+        # Borrar cada parte significativa del nombre de forma dinámica
+        for token in a_limpio.split():
+            if len(token) > 2: # Evitar borrar iniciales que coincidan con otras palabras sueltas
+                desc_limpia = re.sub(r'(?i)\b' + re.escape(token) + r'\b', ' ', desc_limpia)
+                
+    return desc_limpia
 
 
 def extraer_titulo_base(titulo):
@@ -328,14 +364,17 @@ df['category'] = df['category'].fillna('')
 df['description'] = df['description'].fillna('')
 df['language'] = df['language'].fillna('Desconocido')
 
-# Limpiar etiquetas HTML que vienen de WooCommerce en las descripciones
-df['Texto_IA_Limpio'] = df['description'].apply(limpiar_html)
+# Limpiar etiquetas HTML y ruido de marketing en las descripciones
+df['Texto_IA_Limpio'] = df['description'].apply(limpiar_html).apply(limpiar_marketing)
+
+# Remover el nombre del propio autor de la descripción ("Efecto Stormie")
+df['Texto_IA_Limpio'] = df.apply(lambda row: remover_autor_de_descripcion(row['Texto_IA_Limpio'], row['author']), axis=1)
 
 # Construir el texto de entrada para TF-IDF.
-# IMPORTANTE: La categoría NO se incluye aquí (a diferencia de versiones anteriores).
-# La categoría se evalúa como score separado para evitar contaminar el TF-IDF
-# con tokens de categoría que distorsionan las estadísticas de frecuencia.
-df['Texto_IA'] = df['author'] + " " + df['title'] + " " + df['Texto_IA_Limpio']
+# IMPORTANTE: La categoría NO se incluye aquí.
+# El autor explícito TAMPOCO se incluye aquí, porque penaliza la semántica y ya le damos 
+# un 10% de peso directo al autor en la fórmula de similitud (score_autor).
+df['Texto_IA'] = df['title'] + " " + df['Texto_IA_Limpio']
 
 # Precalcular el grupo canónico de categoría para cada libro.
 # Esto mapea variantes como "Children's Fiction" y "Libros Infantiles" al mismo grupo.
@@ -367,7 +406,7 @@ print(f"   → {grupos_encontrados} grupos de categoría detectados, {sin_grupo}
 # =====================================================
 print("4. Entrenando el modelo TF-IDF (bigrams + sublinear_tf + stopwords bilingues)...")
 vectorizer = TfidfVectorizer(
-    max_df=0.80,         # Ignora términos en >80% de documentos (demasiado comunes)
+    max_df=0.65,         # Ignora términos en >65% de documentos (más estricto contra relleno genérico)
     min_df=2,            # Ignora términos en <2 documentos (demasiado raros)
     stop_words=STOPWORDS_BILINGUE,
     ngram_range=(1, 2),  # Captura unigramas y bigramas (ej. "guerra civil", "amor prohibido")
