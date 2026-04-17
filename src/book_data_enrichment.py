@@ -18,8 +18,10 @@ Uso:
 """
 
 import argparse
-import json
+import csv
+import os
 import re
+from difflib import SequenceMatcher
 import sys
 import time
 
@@ -35,7 +37,7 @@ from tqdm import tqdm
 
 from config.settings import (
     DB_CONFIG,
-    GOOGLE_BOOKS_API_KEY,
+    BACKEND_URL,
     LM_STUDIO_BASE_URL,
     LM_STUDIO_MODEL,
 )
@@ -355,67 +357,172 @@ def fase_idioma(dry_run=False, limit=None):
 # FASE 2: Enriquecimiento de descripciones
 # =====================================================
 
-# --- Nivel 1: Google Books API ---
-def buscar_google_books(isbn, titulo=""):
-    """Busca la descripción de un libro en Google Books API por ISBN.
+# --- Excepción custom para señalizar quota agotada ---
+class QuotaExhaustedException(Exception):
+    """Se lanza cuando la quota de Google Books API se agota.
     
-    Retorna la descripción (str) o None si no se encuentra.
+    Los loops de las fases capturan esta excepción y deshabilitan Google Books
+    para el resto del batch, continuando con LM Studio como fallback.
+    """
+    pass
+
+
+# --- Nivel 1: Backend (proxy centralizado a Google Books API) ---
+def buscar_enriquecimiento_backend(isbn):
+    """Consulta el backend para obtener datos de enriquecimiento de Google Books.
+    
+    El backend centraliza la API key y el circuit breaker de quota.
+    Retorna un dict con {description, authors, imageUrl, publisher} o None.
+    Lanza QuotaExhaustedException si el backend reporta quota agotada (HTTP 429).
     """
     if not isbn or str(isbn).strip() == "":
         return None
 
-    isbn_limpio = re.sub(r'[^0-9X]', '', str(isbn).upper())
-    if not isbn_limpio:
+    try:
+        resp = requests.get(
+            f"{BACKEND_URL}/api/catalogue/autocomplete",
+            params={"isbn": isbn},
+            timeout=10,
+        )
+
+        # Detectar quota agotada — el backend devuelve 429 + Retry-After
+        if resp.status_code == 429:
+            try:
+                retry_after = resp.json().get("retryAfterSeconds", 3600)
+            except ValueError:
+                retry_after = 3600
+            raise QuotaExhaustedException(
+                f"Quota de Google Books agotada (backend respondió 429). "
+                f"Retry en {retry_after // 60} minutos."
+            )
+
+        # ISBN no encontrado en Google Books (404) — no es un error
+        if resp.status_code == 404:
+            return None
+
+        # ISBN con formato inválido (400) — data sucia en el catálogo, skip silencioso
+        if resp.status_code == 400:
+            return None
+
+        # Google Books API temporalmente no disponible (503) — skip silencioso
+        if resp.status_code == 503:
+            return None
+
+        resp.raise_for_status()
+        return resp.json()
+
+    except QuotaExhaustedException:
+        raise  # Propagar siempre — el loop decide qué hacer
+    except requests.RequestException as e:
+        tqdm.write(f"   ⚠️ Error inesperado consultando backend: {e}")
         return None
 
-    try:
-        params = {"q": f"isbn:{isbn_limpio}", "maxResults": 1}
-        if GOOGLE_BOOKS_API_KEY:
-            params["key"] = GOOGLE_BOOKS_API_KEY
 
+# --- Validación de título (protección contra ISBN mismatch) ---
+def titulos_coinciden(titulo_local, titulo_api, umbral=0.45):
+    """Verifica que dos títulos se refieran al mismo libro.
+    
+    Usa coincidencia fuzzy para tolerar variaciones comunes:
+    - Subtítulos añadidos: "El Principito" vs "El Principito (Edición Ilustrada)"
+    - Diferencias de mayúsculas: "cien años de soledad" vs "Cien Años de Soledad"
+    - Artículos y puntuación menores
+    
+    Retorna True si los títulos coinciden razonablemente.
+    """
+    if not titulo_local or not titulo_api:
+        return False
+    
+    # Normalizar: minúsculas, sin signos de puntuación, solo espacios simples
+    def limpiar_titulo(t):
+        t = str(t).lower().strip()
+        t = re.sub(r'[^\w\s]', '', t)
+        return ' '.join(t.split())
+        
+    a = limpiar_titulo(titulo_local)
+    b = limpiar_titulo(titulo_api)
+    
+    # Coincidencia exacta (después de normalizar)
+    if a == b:
+        return True
+    
+    # Uno contiene al otro (subtítulos, ediciones)
+    if a in b or b in a:
+        return True
+    
+    # Similitud fuzzy
+    return SequenceMatcher(None, a, b).ratio() >= umbral
+
+def guardar_mismatch_csv(sku, isbn, titulo_local, titulo_api, fuente):
+    """Guarda los mismatches en un CSV para revisión manual posterior."""
+    archivo = "isbn_mismatches_pendientes.csv"
+    file_exists = os.path.isfile(archivo)
+    try:
+        with open(archivo, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['SKU', 'ISBN', 'Titulo Catalogo', 'Titulo API', 'Fuente API'])
+            writer.writerow([sku, isbn, titulo_local, str(titulo_api).replace('\n', ' '), fuente])
+    except Exception as e:
+        pass
+
+
+# --- Nivel 2: Open Library (fallback gratuito, sin API key) ---
+def buscar_openlibrary(isbn):
+    """Consulta Open Library por ISBN. Retorna dict con title, authors o None.
+    
+    Open Library es gratuita, sin API key, mantenida por Internet Archive.
+    No tiene límites estrictos de quota.
+    """
+    if not isbn or str(isbn).strip() == "":
+        return None
+    
+    isbn_limpio = re.sub(r'[^0-9X]', '', str(isbn).upper())
+    if not isbn_limpio or len(isbn_limpio) < 10:
+        return None
+    
+    try:
         resp = requests.get(
-            "https://www.googleapis.com/books/v1/volumes",
-            params=params,
+            f"https://openlibrary.org/api/books",
+            params={
+                "bibkeys": f"ISBN:{isbn_limpio}",
+                "format": "json",
+                "jscmd": "data",
+            },
             timeout=10,
         )
         resp.raise_for_status()
         data = resp.json()
-
-        if data.get("totalItems", 0) > 0:
-            volume_info = data["items"][0].get("volumeInfo", {})
-            descripcion = volume_info.get("description", "")
-            if descripcion and len(descripcion.strip()) > 20:
-                return limpiar_html(descripcion.strip())
+        
+        key = f"ISBN:{isbn_limpio}"
+        if key not in data:
+            return None
+        
+        book = data[key]
+        result = {"title": book.get("title", "")}
+        
+        # Extraer autores
+        authors_raw = book.get("authors", [])
+        if authors_raw:
+            result["authors"] = [a.get("name", "") for a in authors_raw if a.get("name")]
+        
+        # Extraer descripción (si existe)
+        desc = book.get("description", "")
+        if isinstance(desc, dict):
+            desc = desc.get("value", "")
+        result["description"] = desc
+        
+        # Extraer publisher
+        publishers = book.get("publishers", [])
+        if publishers:
+            result["publisher"] = publishers[0].get("name", "")
+        
+        return result
+        
     except requests.RequestException:
-        pass  # Silenciar errores de red, se intenta con el siguiente nivel
-
-    # Fallback: buscar por título si ISBN no dio resultado
-    if titulo and len(titulo) > 3:
-        try:
-            params = {"q": f"intitle:{titulo}", "maxResults": 1}
-            if GOOGLE_BOOKS_API_KEY:
-                params["key"] = GOOGLE_BOOKS_API_KEY
-
-            resp = requests.get(
-                "https://www.googleapis.com/books/v1/volumes",
-                params=params,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            if data.get("totalItems", 0) > 0:
-                volume_info = data["items"][0].get("volumeInfo", {})
-                descripcion = volume_info.get("description", "")
-                if descripcion and len(descripcion.strip()) > 20:
-                    return limpiar_html(descripcion.strip())
-        except requests.RequestException:
-            pass
-
-    return None
+        return None
 
 
-# --- Nivel 2: LM Studio (modelo local, API OpenAI-compatible) ---
+# --- Nivel 3: LM Studio (modelo local, API OpenAI-compatible) ---
 def generar_descripcion_lm_studio(titulo, autor, categoria, idioma):
     """Genera una descripción de libro usando LM Studio (Qwen 3.5 9B).
     
@@ -516,19 +623,53 @@ def fase_descripcion(dry_run=False, limit=None):
     count_sin = 0
     cambios = []
 
+    google_deshabilitado = False  # Se activa cuando la quota de Google se agota
+
     for row in tqdm(rows, desc="Buscando descripciones"):
         book_id, sku, titulo, autor, isbn, categoria, idioma = row
 
         descripcion = None
         fuente = None
 
-        # Nivel 1: Google Books API
-        descripcion = buscar_google_books(isbn, titulo)
-        if descripcion:
-            fuente = "Google Books"
-            count_google += 1
-        elif lm_studio_disponible:
-            # Nivel 2: LM Studio local (Qwen 3.5 9B)
+        # Nivel 1: Backend → Google Books API (si no está deshabilitado por quota)
+        if not google_deshabilitado:
+            try:
+                enriquecimiento = buscar_enriquecimiento_backend(isbn)
+                if enriquecimiento:
+                    # Validación de título: protege contra ISBN mismatch
+                    titulo_api = enriquecimiento.get("title", "")
+                    if not titulos_coinciden(titulo, titulo_api):
+                        tqdm.write(f"   ⚠️ ISBN mismatch para [{sku}]: \"{titulo[:30]}\" vs Google: \"{str(titulo_api)[:30]}\" — guardado en CSV")
+                        guardar_mismatch_csv(sku, isbn, titulo, titulo_api, 'Google Books')
+                    else:
+                        desc_raw = enriquecimiento.get("description", "")
+                        if desc_raw and len(str(desc_raw).strip()) > 20:
+                            descripcion = limpiar_html(str(desc_raw).strip())
+                if descripcion:
+                    fuente = "Google Books"
+                    count_google += 1
+            except QuotaExhaustedException as e:
+                google_deshabilitado = True
+                tqdm.write(f"\n   ⚠️ {e}")
+                tqdm.write(f"   → Google Books deshabilitado para el resto del batch.")
+                tqdm.write(f"   → Continuando con Open Library y LM Studio como fallback...")
+
+        # Nivel 2: Open Library (si Google no dio resultado)
+        if not descripcion:
+            ol_data = buscar_openlibrary(isbn)
+            if ol_data:
+                titulo_api = ol_data.get("title", "")
+                if titulos_coinciden(titulo, titulo_api):
+                    desc_raw = ol_data.get("description", "")
+                    if desc_raw and len(str(desc_raw).strip()) > 20:
+                        descripcion = limpiar_html(str(desc_raw).strip())
+                        fuente = "Open Library"
+                        count_lm_studio += 1  # Reutilizamos el counter como "otros"
+                else:
+                    guardar_mismatch_csv(sku, isbn, titulo, titulo_api, 'Open Library')
+
+        # Nivel 3: LM Studio local (solo para descripciones, NO para autores)
+        if not descripcion and lm_studio_disponible:
             idioma_libro = idioma if es_idioma_valido(idioma) else "Spanish"
             descripcion = generar_descripcion_lm_studio(titulo, autor, categoria, idioma_libro)
             if descripcion:
@@ -549,8 +690,8 @@ def fase_descripcion(dry_run=False, limit=None):
         else:
             count_sin += 1
 
-        # Rate limiting para Google Books API (~1 req/seg para no exceder cuota)
-        time.sleep(0.3)
+        # Rate limiting: 1 req/seg para respetar el límite de 100 req/min de Google
+        time.sleep(1.0)
 
     # Aplicar cambios
     if cambios:
@@ -781,47 +922,10 @@ def normalizar_autor(autor_raw):
     return ", ".join(autores_normalizados)
 
 
-def buscar_autor_google_books(isbn, titulo=""):
-    """Busca el autor de un libro en Google Books API por ISBN (o título como fallback).
+# Excepción custom para señalizar quota agotada y que el loop decida qué hacer
+class QuotaExhaustedException(Exception):
+    pass
 
-    Retorna el string de autores normalizado o None si no se encuentra.
-    """
-    def _buscar(params):
-        try:
-            if GOOGLE_BOOKS_API_KEY:
-                params["key"] = GOOGLE_BOOKS_API_KEY
-            resp = requests.get(
-                "https://www.googleapis.com/books/v1/volumes",
-                params=params,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("totalItems", 0) > 0:
-                volume_info = data["items"][0].get("volumeInfo", {})
-                autores = volume_info.get("authors", [])
-                if autores:
-                    # Google Books ya devuelve "First Last", solo unir y normalizar
-                    return ", ".join(autores)
-        except requests.RequestException:
-            pass
-        return None
-
-    # Intento 1: por ISBN
-    if isbn and str(isbn).strip():
-        isbn_limpio = re.sub(r'[^0-9X]', '', str(isbn).upper())
-        if isbn_limpio:
-            resultado = _buscar({"q": f"isbn:{isbn_limpio}", "maxResults": 1})
-            if resultado:
-                return resultado
-
-    # Intento 2: por título
-    if titulo and len(titulo) > 3:
-        resultado = _buscar({"q": f"intitle:{titulo}", "maxResults": 1})
-        if resultado:
-            return resultado
-
-    return None
 
 
 def buscar_autor_lm_studio(titulo, isbn="", categoria=""):
@@ -882,78 +986,26 @@ def buscar_autor_lm_studio(titulo, isbn="", categoria=""):
 
 
 def fase_autor(dry_run=False, limit=None):
-    """Fase 3: Normaliza autores existentes y rellena autores NULL.
+    """Fase 3: Rellena autores NULL usando Google Books + Open Library.
 
-    Paso 1: Normaliza autores existentes (Last,First → First Last, limpieza).
-    Paso 2: Rellena autores NULL con Google Books API + LM Studio.
+    Solo busca autores para libros que no tienen autor asignado.
+    La normalización de autores existentes se maneja por separado
+    con el script `normalize_authors.py`.
     """
     print("\n" + "=" * 60)
     print("✍️  FASE 3: Enriquecimiento de autores")
     print("=" * 60)
 
-    # --- Paso 1: Normalizar autores existentes ---
-    print("\n   Paso 1: Normalización de autores existentes...")
-    query_existentes = """
-        SELECT id, sku, title, author
-        FROM books
-        WHERE author IS NOT NULL AND TRIM(author) != ''
-    """
-    if limit:
-        query_existentes += f" LIMIT {int(limit)}"
-
-    with engine.connect() as conn:
-        rows_existentes = conn.execute(text(query_existentes)).fetchall()
-
-    cambios_norm = []
-    if rows_existentes:
-        for row in tqdm(rows_existentes, desc="Normalizando autores"):
-            book_id, sku, titulo, autor_actual = row
-            autor_normalizado = normalizar_autor(autor_actual)
-
-            # Solo guardar si realmente cambió
-            if autor_normalizado and autor_normalizado != str(autor_actual).strip():
-                cambios_norm.append({
-                    "id": book_id,
-                    "sku": sku,
-                    "titulo": titulo,
-                    "autor_anterior": str(autor_actual)[:80],
-                    "autor_nuevo": autor_normalizado,
-                })
-
-        print(f"   → {len(cambios_norm)}/{len(rows_existentes)} autores necesitan normalización")
-    else:
-        print("   → No hay libros con autor existente.")
-
-    # Aplicar normalizaciones
-    if cambios_norm:
-        if dry_run:
-            print(f"\n🔍 DRY-RUN: Se normalizarían {len(cambios_norm)} autores:")
-            for c in cambios_norm[:15]:
-                print(f"   [{c['sku']}] \"{c['titulo'][:40]}\"")
-                print(f"      ❌ {c['autor_anterior']}")
-                print(f"      ✅ {c['autor_nuevo']}")
-            if len(cambios_norm) > 15:
-                print(f"   ... y {len(cambios_norm) - 15} más")
-        else:
-            print(f"\n💾 Guardando {len(cambios_norm)} autores normalizados...")
-            with engine.begin() as conn:
-                sql = text("UPDATE books SET author = :autor WHERE id = :id")
-                lote = []
-                for i, c in enumerate(cambios_norm):
-                    lote.append({"autor": c["autor_nuevo"], "id": c["id"]})
-                    if (i + 1) % 50 == 0:
-                        conn.execute(sql, lote)
-                        lote.clear()
-                if lote:
-                    conn.execute(sql, lote)
-            print("   ✅ Autores normalizados correctamente.")
-
-    # --- Paso 2: Rellenar autores NULL ---
-    print("\n   Paso 2: Buscando autores para libros sin autor...")
+    # --- Buscar autores NULL ---
+    print("\n   Buscando autores para libros sin autor...")
     query_nulls = """
         SELECT id, sku, title, isbn, category
         FROM books
-        WHERE author IS NULL OR TRIM(author) = ''
+        WHERE author IS NULL 
+           OR TRIM(author) = ''
+           -- Limpia espacios, puntos, comas y slashes, y luego compara si queda solo 'NA'
+           OR UPPER(REPLACE(REPLACE(REPLACE(REPLACE(author, ' ', ''), '.', ''), ',', ''), '/', '')) = 'NA'
+           OR UPPER(TRIM(author)) IN ('SIN AUTOR', '-')
     """
     if limit:
         query_nulls += f" LIMIT {int(limit)}"
@@ -966,42 +1018,59 @@ def fase_autor(dry_run=False, limit=None):
     else:
         print(f"   → {len(rows_nulls)} libros sin autor")
 
-    # Verificar disponibilidad de LM Studio
-    lm_studio_disponible = False
-    if rows_nulls:
-        try:
-            resp = requests.get(f"{LM_STUDIO_BASE_URL}/v1/models", timeout=5)
-            if resp.status_code == 200:
-                modelos = [m["id"] for m in resp.json().get("data", [])]
-                lm_studio_disponible = len(modelos) > 0
-                if lm_studio_disponible:
-                    print(f"   ✅ LM Studio disponible como fallback")
-                else:
-                    print(f"   ⚠️ LM Studio activo pero sin modelos cargados.")
-        except requests.RequestException:
-            print("   ℹ️ LM Studio no disponible. Solo se usará Google Books API.")
-
     count_google = 0
-    count_lm = 0
+    count_openlibrary = 0
     count_sin = 0
+    count_mismatch = 0
     cambios_nulls = []
+
+    google_deshabilitado = False  # Se activa cuando la quota de Google se agota
 
     for row in tqdm(rows_nulls, desc="Buscando autores"):
         book_id, sku, titulo, isbn, categoria = row
         autor = None
         fuente = None
 
-        # Nivel 1: Google Books API
-        autor = buscar_autor_google_books(isbn, titulo)
-        if autor:
-            fuente = "Google Books"
-            count_google += 1
-        elif lm_studio_disponible:
-            # Nivel 2: LM Studio
-            autor = buscar_autor_lm_studio(titulo or "", isbn or "", categoria or "")
-            if autor:
-                fuente = "LM Studio"
-                count_lm += 1
+        # Nivel 1: Backend → Google Books API (si no está deshabilitado por quota)
+        if not google_deshabilitado:
+            try:
+                enriquecimiento = buscar_enriquecimiento_backend(isbn)
+                if enriquecimiento:
+                    # Validación de título: protege contra ISBN mismatch
+                    titulo_api = enriquecimiento.get("title", "")
+                    if not titulos_coinciden(titulo, titulo_api):
+                        tqdm.write(f"   ⚠️ ISBN mismatch [{sku}]: \"{titulo[:30]}\" vs Google: \"{str(titulo_api)[:30]}\" — guardado en CSV")
+                        guardar_mismatch_csv(sku, isbn, titulo, titulo_api, 'Google Books')
+                        count_mismatch += 1
+                    else:
+                        autores = enriquecimiento.get("authors", [])
+                        if autores:
+                            autor = ", ".join(autores)
+                if autor:
+                    fuente = "Google Books"
+                    count_google += 1
+            except QuotaExhaustedException as e:
+                google_deshabilitado = True
+                tqdm.write(f"\n   ⚠️ {e}")
+                tqdm.write(f"   → Google Books deshabilitado. Continuando con Open Library...")
+
+        # Nivel 2: Open Library (fallback sin API key)
+        if not autor:
+            ol_data = buscar_openlibrary(isbn)
+            if ol_data:
+                titulo_api = ol_data.get("title", "")
+                if titulos_coinciden(titulo, titulo_api):
+                    autores = ol_data.get("authors", [])
+                    if autores:
+                        autor = ", ".join(autores)
+                        fuente = "Open Library"
+                        count_openlibrary += 1
+                else:
+                    tqdm.write(f"   ⚠️ ISBN mismatch [{sku}]: \"{titulo[:30]}\" vs OpenLib: \"{str(titulo_api)[:30]}\" — guardado en CSV")
+                    guardar_mismatch_csv(sku, isbn, titulo, titulo_api, 'Open Library')
+                    count_mismatch += 1
+
+        # NO hay Nivel 3 (LM Studio) para autores — datos factuales no se inventan
 
         if autor:
             cambios_nulls.append({
@@ -1014,8 +1083,8 @@ def fase_autor(dry_run=False, limit=None):
         else:
             count_sin += 1
 
-        # Rate limiting para Google Books API
-        time.sleep(0.3)
+        # Rate limiting: 1 req/seg para respetar el límite de 100 req/min de Google
+        time.sleep(1.0)
 
     # Aplicar cambios
     if cambios_nulls:
@@ -1041,16 +1110,16 @@ def fase_autor(dry_run=False, limit=None):
 
     # Estadísticas
     stats = {
-        "total_normalizados": len(cambios_norm),
-        "total_existentes": len(rows_existentes) if rows_existentes else 0,
         "total_nulls": len(rows_nulls),
         "google_books": count_google,
-        "lm_studio": count_lm,
+        "open_library": count_openlibrary,
+        "isbn_mismatch": count_mismatch,
         "sin_autor": count_sin,
     }
-    print(f"\n📊 Fase 3: {len(cambios_norm)} normalizados | "
-          f"{count_google} Google Books + {count_lm} LM Studio = "
-          f"{count_google + count_lm} autores nuevos | "
+    total_resueltos = count_google + count_openlibrary
+    print(f"\n📊 Fase 3: {count_google} Google Books + {count_openlibrary} Open Library = "
+          f"{total_resueltos} autores nuevos | "
+          f"{count_mismatch} ISBN mismatch | "
           f"{count_sin} sin resolver")
     return stats
 
@@ -1361,8 +1430,8 @@ def main():
         print(f"   Formato HTML:  {s['formateados']}/{s['total']} descripciones convertidas a HTML")
     if "autor" in stats:
         s = stats["autor"]
-        print(f"   Autores:       {s['total_normalizados']}/{s['total_existentes']} normalizados")
-        print(f"                  {s['google_books']} Google Books + {s['lm_studio']} LM Studio / {s['total_nulls']} NULLs")
+        print(f"   Autores:       {s['google_books']} Google Books + {s['open_library']} Open Lib / {s['total_nulls']} NULLs")
+        print(f"                  {s['isbn_mismatch']} ISBN mismatches detectados")
         if s['sin_autor'] > 0:
             print(f"                  {s['sin_autor']} quedaron sin autor")
     if "tags" in stats:
