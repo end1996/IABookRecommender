@@ -1,0 +1,2 @@
+# This directory contains trained ML model artifacts (.pkl files)
+# .pkl files are excluded from git via .gitignore

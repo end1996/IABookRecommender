@@ -3,10 +3,26 @@ import hashlib
 from sqlalchemy import create_engine, text
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
-import numpy as np
+import joblib
 from tqdm import tqdm
 import re
+import os
 from config.settings import DB_CONFIG, CANTIDAD_RECOMENDACIONES
+
+# =====================================================
+# CLASIFICADOR DE CATEGORÍAS: Modelo entrenado (.pkl)
+# Entrenado en Colab con SGDClassifier sobre raw_category + description.
+# El pipeline encapsula TF-IDF + SGDClassifier — recibe texto crudo.
+# =====================================================
+MODELO_CLASIFICADOR_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "clasificador_categorias_v3.pkl")
+UMBRAL_CONFIANZA_CATEGORIA = 0.60  # Solo aceptar predicciones con ≥60% de confianza
+
+clf_categorias = None
+if os.path.exists(MODELO_CLASIFICADOR_PATH):
+    clf_categorias = joblib.load(MODELO_CLASIFICADOR_PATH)
+    print(f"✅ Clasificador de categorías cargado: {MODELO_CLASIFICADOR_PATH}")
+else:
+    print(f"⚠️  No se encontró {MODELO_CLASIFICADOR_PATH}. Sin bonus de categoría en scoring.")
 
 # Construimos la URL usando el diccionario de settings.py
 DB_URL = (
@@ -121,93 +137,6 @@ STOPWORDS_BILINGUE = STOPWORDS_ESPANOL + STOPWORDS_INGLES
 SEPARADORES_AUTORES = r'[,|;/&]'
 
 # =====================================================
-# Mapeo de sinónimos de categorías
-#
-# Las categorías en WooCommerce no están normalizadas: existen variantes
-# en español e inglés, con distintas mayúsculas y separadores.
-# Ejemplo: "Children's Fiction" (1001), "Libros Infantiles" (607),
-#          "Children Fiction" (190), "Children Book" (120)
-#          → Todos representan el mismo género: 'infantil'
-#
-# Este diccionario mapea cada variante conocida a un grupo canónico.
-# La normalización ocurre SOLO en el script (no modifica la BD).
-# =====================================================
-CATEGORIA_SINONIMOS = {
-    'infantil': [
-        "Children's Fiction", "Children Fiction", "Children Book",
-        "Children's Non-Fiction", "Children Non-Fiction",
-        "Libros Infantiles", "Libros Infantiles en Español",
-        "Cuentos para niños", "Cuentos Infantiles", "Board books",
-        "Kids & Children", "Kids (12 & Under)",
-        "Libros para bebés", "Libros de actividades", "Activity Books",
-        "I CAN READ",
-    ],
-    'juvenil': [
-        "Juvenile Fiction", "Juvenile Nonfiction",
-        "Novelas Juveniles", "Young Adult Fiction", "Young Adult",
-        "Tweens Fiction", "Kids: Middle Grade", "Kids Middle Grade",
-    ],
-    'ficcion': [
-        "Fiction", "General Fiction", "Novels", "Novelas",
-    ],
-    'accion_aventura': [
-        "Action & Adventure", "Action", "Adventure",
-    ],
-    'fantasia_scifi': [
-        "Fantasy", "Science Fiction",
-    ],
-    'cocina': [
-        "Cook Book", "Cocina",
-    ],
-    'religion': [
-        "Religion", "Religión y Espiritualidad", "Religion & Spirituality",
-    ],
-    'comics': [
-        "Cómics de Colección", "Comics & Graphic Novels",
-    ],
-    'arte_fotografia': [
-        "Arte", "Fotografía y diseño", "Art & Photography",
-    ],
-    'historia_cultura': [
-        "Historia y Cultura",
-    ],
-    'cuentos': [
-        "Cuentos",
-    ],
-    'aprendizaje': [
-        "Aprendizaje", "Learning Books",
-    ],
-    'animales': [
-        "Libros de animales", "Animals",
-    ],
-    'bienestar_salud': [
-        "Bienestar y Salud",
-    ],
-    'colorear': [
-        "Libros para colorear",
-    ],
-    'navidad': [
-        "Libros de Navidad", "Christmas Books",
-    ],
-    'halloween': [
-        "Libros de Halloween para Niños",
-    ],
-    'conejos': [
-        "Libros de Conejos",
-    ],
-}
-
-# Categorías que son ruido: no describen temática/género sino promociones,
-# temporadas o rangos de precio. Si dos libros comparten solo estas categorías,
-# NO se les debe dar bonus de categoría (retornan None en get_grupo_categoria).
-CATEGORIAS_RUIDO = [
-    "Novedades", "2025", "Easter",
-    "Día de la Madre", "Día de la mujer",
-    "Libros hasta 9.90", "Libros en Español",
-]
-
-
-# =====================================================
 # Funciones utilitarias
 # =====================================================
 def limpiar_html(texto):
@@ -259,42 +188,6 @@ def extraer_titulo_base(titulo):
     return t
 
 
-def normalizar_categoria(cat):
-    """Normaliza una categoría para comparación flexible (sin modificar la BD)."""
-    cat = str(cat).strip().lower()
-    cat = re.sub(r'[>\-/|,.:;()[\]{}\'\"&]', ' ', cat)
-    cat = re.sub(r'\s+', ' ', cat).strip()
-    return cat
-
-
-# Pre-construir diccionario invertido al cargar el módulo:
-# {"children s fiction": "infantil", "libros infantiles": "infantil", ...}
-# Esto permite búsquedas O(1) en vez de iterar el diccionario original.
-_MAPA_CAT_A_GRUPO = {}
-for _grupo, _variantes in CATEGORIA_SINONIMOS.items():
-    for _variante in _variantes:
-        _MAPA_CAT_A_GRUPO[normalizar_categoria(_variante)] = _grupo
-
-_CATEGORIAS_RUIDO_NORM = {normalizar_categoria(c) for c in CATEGORIAS_RUIDO}
-
-
-def get_grupo_categoria(cat_normalizada):
-    """Mapea una categoría normalizada a su grupo canónico.
-    Retorna None si es una categoría de ruido (sin señal temática).
-    Retorna la categoría misma como fallback si no está en el mapeo."""
-    if not cat_normalizada or cat_normalizada in _CATEGORIAS_RUIDO_NORM:
-        return None
-    # Búsqueda exacta en el mapeo
-    if cat_normalizada in _MAPA_CAT_A_GRUPO:
-        return _MAPA_CAT_A_GRUPO[cat_normalizada]
-    # Búsqueda parcial: si la categoría contiene una variante conocida
-    for variante_norm, grupo in _MAPA_CAT_A_GRUPO.items():
-        if variante_norm in cat_normalizada:
-            return grupo
-    # Fallback: la categoría normalizada actúa como su propio grupo
-    return cat_normalizada
-
-
 def score_categoria(grupo_a, grupo_b):
     """1.0 si ambos pertenecen al mismo grupo, 0.0 si no."""
     if not grupo_a or not grupo_b:
@@ -342,8 +235,9 @@ try:
         SELECT DISTINCT b.sku
         FROM books b
         INNER JOIN book_stock_locations bsl ON b.id = bsl.book_id
+        INNER JOIN external_product_integration epi ON b.sku = epi.sku
         WHERE bsl.stock > 0
-          AND b.wc_product_id IS NOT NULL
+          AND epi.external_id IS NOT NULL
     """
     df_elegibles = pd.read_sql(query_elegibles, engine)
     elegibles = set(df_elegibles['sku'].astype(str).values)
@@ -376,10 +270,24 @@ df['Texto_IA_Limpio'] = df.apply(lambda row: remover_autor_de_descripcion(row['T
 # un 10% de peso directo al autor en la fórmula de similitud (score_autor).
 df['Texto_IA'] = df['title'] + " " + df['Texto_IA_Limpio']
 
-# Precalcular el grupo canónico de categoría para cada libro.
-# Esto mapea variantes como "Children's Fiction" y "Libros Infantiles" al mismo grupo.
-df['categoria_normalizada'] = df['category'].apply(normalizar_categoria)
-df['grupo_categoria'] = df['categoria_normalizada'].apply(get_grupo_categoria)
+# Predecir categoría normalizada usando el clasificador entrenado.
+# El modelo recibe "raw_category | description" y devuelve la categoría canónica.
+if clf_categorias is not None:
+    features_clf = df['category'].fillna('') + " | " + df['description'].fillna('')
+    df['grupo_categoria'] = clf_categorias.predict(features_clf)
+
+    # Aplicar umbral de confianza: predicciones dudosas → None (sin bonus)
+    probas = clf_categorias.predict_proba(features_clf)
+    confianzas = probas.max(axis=1)
+    df.loc[confianzas < UMBRAL_CONFIANZA_CATEGORIA, 'grupo_categoria'] = None
+
+    clasificados = df['grupo_categoria'].notna().sum()
+    descartados = (confianzas < UMBRAL_CONFIANZA_CATEGORIA).sum()
+    print(f"   → {clasificados} libros clasificados con confianza ≥ {UMBRAL_CONFIANZA_CATEGORIA}")
+    print(f"   → {descartados} libros sin bonus de categoría (confianza insuficiente)")
+else:
+    df['grupo_categoria'] = None
+    print("   ⚠️ Sin clasificador — categorías no disponibles para scoring")
 
 # Precalcular sets de autores separando por delimitadores (coma, pipe, etc.)
 # para que la comparación por intersección funcione con múltiples autores.
@@ -501,7 +409,6 @@ try:
                 s_cat = score_categoria(grupo_cat_actual, lista_grupos_cat[i])
                 s_autor = score_autor(autores_actual, lista_autores_set[i])
 
-                # Fórmula: score = 0.45×contenido + 0.45×categoría + 0.10×autor
                 score_final = (
                     PESO_CONTENIDO * sim_contenido
                     + PESO_CATEGORIA * s_cat
@@ -567,26 +474,28 @@ def hashear_sku(sku, salt="=]&Roy%!?vK8"):
     hash_completo = hashlib.sha256(texto_a_hashear).hexdigest()
     return hash_completo[:16] 
 
-# Usamos una copia del DataFrame principal (df) de los textos procesados
-df_kaggle = df.copy()
+def normalizar_idioma(lang):
+    lang = str(lang).strip().lower()
+    mapa = {'es': 'ES', 'español': 'ES', 'spanish': 'ES', 'spa': 'ES',
+            'en': 'EN', 'english': 'EN', 'inglés': 'EN', 'eng': 'EN'}
+    return mapa.get(lang, 'OTRO' if lang else 'DES')
 
-# Generación la nueva columna con los SKUs ofuscados
+df_kaggle = df.copy()
 df_kaggle['sku_anonimo'] = df_kaggle['sku'].apply(hashear_sku)
 
-# Filtrar estrictamente las columnas que son públicas y útiles para NLP
-columnas_seguras = [
-    'sku_anonimo', 
-    'title', 
-    'author', 
-    'grupo_categoria', 
-    'language', 
-    'Texto_IA_Limpio' 
+# Normalización estricta
+df_kaggle['grupo_categoria'] = df_kaggle['grupo_categoria'].fillna('sin_clasificar')
+df_kaggle['language'] = df_kaggle['language'].apply(normalizar_idioma)
+
+# Filtro de calidad: solo libros con texto real y título válido
+df_export = df_kaggle[['sku_anonimo', 'title', 'author', 'grupo_categoria', 'language', 'Texto_IA_Limpio']].copy()
+df_export = df_export[
+    (df_export['title'].str.strip() != '') & 
+    (df_export['Texto_IA_Limpio'].str.strip().str.len() > 20)
 ]
 
-df_export = df_kaggle[columnas_seguras]
-
-# Exportación del archivo CSV final
-nombre_archivo = 'book_catalog_features_kaggle.csv'
-df_export.to_csv(nombre_archivo, index=False)
-
-print(f"¡Dataset generado con éxito: {nombre_archivo}!")
+# Exportación limpia
+nombre_archivo = 'book_catalog_clean_kaggle.csv'
+df_export.to_csv(nombre_archivo, index=False, encoding='utf-8-sig')
+print(f"✅ Dataset limpio generado: {nombre_archivo}")
+print(f"📊 {len(df_export)} filas válidas exportadas. Categorías únicas: {df_export['grupo_categoria'].nunique()}")

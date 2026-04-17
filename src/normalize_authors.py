@@ -21,7 +21,6 @@ Uso:
 
 import argparse
 import csv
-import os
 import sys
 
 # Fix para consolas de Windows que no soportan emoji/Unicode por defecto
