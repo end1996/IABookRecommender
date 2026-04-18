@@ -85,6 +85,57 @@ IDIOMA_INSTRUCCION = {
 
 
 # =====================================================
+# Rutas de Salida y Caché Negativa
+# =====================================================
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+CACHE_FILE = os.path.join(OUTPUT_DIR, "google_books_not_found.txt")
+
+CACHE_GOOGLE_NOT_FOUND = set()
+CACHE_CARGADA = False
+
+def cargar_cache_si_necesario():
+    global CACHE_CARGADA
+    if not CACHE_CARGADA:
+        if os.path.isfile(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    val = line.strip()
+                    if val:
+                        CACHE_GOOGLE_NOT_FOUND.add(val)
+        CACHE_CARGADA = True
+
+def guardar_en_cache_negativa(isbn):
+    CACHE_GOOGLE_NOT_FOUND.add(str(isbn))
+    try:
+        with open(CACHE_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{isbn}\n")
+    except Exception:
+        pass
+
+CACHE_NO_FIELD = {"author": set(), "description": set()}
+
+def cargar_cache_field(campo):
+    archivo = os.path.join(OUTPUT_DIR, f"google_books_no_{campo}.txt")
+    if os.path.isfile(archivo):
+        with open(archivo, "r", encoding="utf-8") as f:
+            for line in f:
+                val = line.strip()
+                if val:
+                    CACHE_NO_FIELD[campo].add(val)
+
+def guardar_cache_field(campo, isbn):
+    if not isbn: return
+    CACHE_NO_FIELD[campo].add(str(isbn))
+    archivo = os.path.join(OUTPUT_DIR, f"google_books_no_{campo}.txt")
+    try:
+        with open(archivo, "a", encoding="utf-8") as f:
+            f.write(f"{isbn}\n")
+    except:
+        pass
+
+
+# =====================================================
 # Utilidades
 # =====================================================
 def limpiar_html(texto):
@@ -368,7 +419,7 @@ class QuotaExhaustedException(Exception):
 
 
 # --- Nivel 1: Backend (proxy centralizado a Google Books API) ---
-def buscar_enriquecimiento_backend(isbn):
+def buscar_enriquecimiento_backend(isbn, max_retries=3):
     """Consulta el backend para obtener datos de enriquecimiento de Google Books.
     
     El backend centraliza la API key y el circuit breaker de quota.
@@ -378,44 +429,70 @@ def buscar_enriquecimiento_backend(isbn):
     if not isbn or str(isbn).strip() == "":
         return None
 
-    try:
-        resp = requests.get(
-            f"{BACKEND_URL}/api/catalogue/autocomplete",
-            params={"isbn": isbn},
-            timeout=10,
-        )
+    cargar_cache_si_necesario()
+    isbn_limpio = re.sub(r'[^0-9X]', '', str(isbn).upper())
+    
+    if isbn_limpio and isbn_limpio in CACHE_GOOGLE_NOT_FOUND:
+        # Cache hit negativo: este ISBN ya falló en Google anteriormente.
+        return None
 
-        # Detectar quota agotada — el backend devuelve 429 + Retry-After
-        if resp.status_code == 429:
-            try:
-                retry_after = resp.json().get("retryAfterSeconds", 3600)
-            except ValueError:
-                retry_after = 3600
-            raise QuotaExhaustedException(
-                f"Quota de Google Books agotada (backend respondió 429). "
-                f"Retry en {retry_after // 60} minutos."
+    for intento in range(max_retries):
+        try:
+            resp = requests.get(
+                f"{BACKEND_URL}/api/catalogue/autocomplete",
+                params={"isbn": isbn},
+                timeout=10,
             )
 
-        # ISBN no encontrado en Google Books (404) — no es un error
-        if resp.status_code == 404:
+            # Detectar quota agotada — el backend devuelve 429 + Retry-After
+            if resp.status_code == 429:
+                try:
+                    retry_after = resp.json().get("retryAfterSeconds", 3600)
+                except ValueError:
+                    retry_after = 3600
+                raise QuotaExhaustedException(
+                    f"Quota de Google Books agotada (backend respondió 429). "
+                    f"Retry en {retry_after // 60} minutos."
+                )
+
+            # ISBN no encontrado en Google Books (404) — no es un error
+            if resp.status_code == 404:
+                if isbn_limpio:
+                    guardar_en_cache_negativa(isbn_limpio)
+                return None
+
+            # ISBN con formato inválido (400) — data sucia en el catálogo, skip silencioso
+            if resp.status_code == 400:
+                if isbn_limpio:
+                    guardar_en_cache_negativa(isbn_limpio)
+                return None
+
+            # Google Books API temporalmente no disponible (503) — aplicar exponential backoff
+            if resp.status_code == 503:
+                if intento < max_retries - 1:
+                    wait_time = 2 ** (intento + 1)  # 2, 4 segundos
+                    tqdm.write(f"   ⚠️ Reintentando Google Books en {wait_time}s por error 503 para ISBN {isbn}...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    tqdm.write(f"   ❌ Fallo final con Google Books (503) tras {max_retries} intentos para ISBN {isbn}.")
+                    return None
+
+            resp.raise_for_status()
+            return resp.json()
+
+        except QuotaExhaustedException:
+            raise  # Propagar siempre — el loop decide qué hacer
+        except requests.RequestException as e:
+            # Fallos de red como ConnectionError también se benefician del backoff
+            if intento < max_retries - 1:
+                wait_time = 2 ** (intento + 1)
+                tqdm.write(f"   ⚠️ Error de red con el backend. Reintentando en {wait_time}s para ISBN {isbn}...")
+                time.sleep(wait_time)
+                continue
+            
+            tqdm.write(f"   ⚠️ Error inesperado consultando backend tras {max_retries} intentos: {e}")
             return None
-
-        # ISBN con formato inválido (400) — data sucia en el catálogo, skip silencioso
-        if resp.status_code == 400:
-            return None
-
-        # Google Books API temporalmente no disponible (503) — skip silencioso
-        if resp.status_code == 503:
-            return None
-
-        resp.raise_for_status()
-        return resp.json()
-
-    except QuotaExhaustedException:
-        raise  # Propagar siempre — el loop decide qué hacer
-    except requests.RequestException as e:
-        tqdm.write(f"   ⚠️ Error inesperado consultando backend: {e}")
-        return None
 
 
 # --- Validación de título (protección contra ISBN mismatch) ---
@@ -454,7 +531,7 @@ def titulos_coinciden(titulo_local, titulo_api, umbral=0.45):
 
 def guardar_mismatch_csv(sku, isbn, titulo_local, titulo_api, fuente):
     """Guarda los mismatches en un CSV para revisión manual posterior."""
-    archivo = "isbn_mismatches_pendientes.csv"
+    archivo = os.path.join(OUTPUT_DIR, "isbn_mismatches_pendientes.csv")
     file_exists = os.path.isfile(archivo)
     try:
         with open(archivo, 'a', newline='', encoding='utf-8') as f:
@@ -624,15 +701,17 @@ def fase_descripcion(dry_run=False, limit=None):
     cambios = []
 
     google_deshabilitado = False  # Se activa cuando la quota de Google se agota
+    cargar_cache_field("description")
 
     for row in tqdm(rows, desc="Buscando descripciones"):
         book_id, sku, titulo, autor, isbn, categoria, idioma = row
 
         descripcion = None
         fuente = None
+        isbn_limpio = re.sub(r'[^0-9X]', '', str(isbn).upper()) if isbn else ""
 
         # Nivel 1: Backend → Google Books API (si no está deshabilitado por quota)
-        if not google_deshabilitado:
+        if not google_deshabilitado and (not isbn_limpio or isbn_limpio not in CACHE_NO_FIELD["description"]):
             try:
                 enriquecimiento = buscar_enriquecimiento_backend(isbn)
                 if enriquecimiento:
@@ -645,6 +724,9 @@ def fase_descripcion(dry_run=False, limit=None):
                         desc_raw = enriquecimiento.get("description", "")
                         if desc_raw and len(str(desc_raw).strip()) > 20:
                             descripcion = limpiar_html(str(desc_raw).strip())
+                        else:
+                            if isbn_limpio:
+                                guardar_cache_field("description", isbn_limpio)
                 if descripcion:
                     fuente = "Google Books"
                     count_google += 1
@@ -690,8 +772,10 @@ def fase_descripcion(dry_run=False, limit=None):
         else:
             count_sin += 1
 
-        # Rate limiting: 1 req/seg para respetar el límite de 100 req/min de Google
-        time.sleep(1.0)
+        # Rate limiting preventivo solo si no fue salteado por caché
+        isbn_test = re.sub(r'[^0-9X]', '', str(isbn).upper()) if isbn else ""
+        if isbn_test and isbn_test not in CACHE_GOOGLE_NOT_FOUND and isbn_test not in CACHE_NO_FIELD["description"]:
+            time.sleep(2.5)
 
     # Aplicar cambios
     if cambios:
@@ -1025,14 +1109,16 @@ def fase_autor(dry_run=False, limit=None):
     cambios_nulls = []
 
     google_deshabilitado = False  # Se activa cuando la quota de Google se agota
+    cargar_cache_field("author")
 
     for row in tqdm(rows_nulls, desc="Buscando autores"):
         book_id, sku, titulo, isbn, categoria = row
         autor = None
         fuente = None
+        isbn_limpio = re.sub(r'[^0-9X]', '', str(isbn).upper()) if isbn else ""
 
         # Nivel 1: Backend → Google Books API (si no está deshabilitado por quota)
-        if not google_deshabilitado:
+        if not google_deshabilitado and (not isbn_limpio or isbn_limpio not in CACHE_NO_FIELD["author"]):
             try:
                 enriquecimiento = buscar_enriquecimiento_backend(isbn)
                 if enriquecimiento:
@@ -1046,6 +1132,9 @@ def fase_autor(dry_run=False, limit=None):
                         autores = enriquecimiento.get("authors", [])
                         if autores:
                             autor = ", ".join(autores)
+                        else:
+                            if isbn_limpio:
+                                guardar_cache_field("author", isbn_limpio)
                 if autor:
                     fuente = "Google Books"
                     count_google += 1
@@ -1083,8 +1172,10 @@ def fase_autor(dry_run=False, limit=None):
         else:
             count_sin += 1
 
-        # Rate limiting: 1 req/seg para respetar el límite de 100 req/min de Google
-        time.sleep(1.0)
+        # Rate limiting preventivo solo si no fue salteado por caché
+        isbn_test = re.sub(r'[^0-9X]', '', str(isbn).upper()) if isbn else ""
+        if isbn_test and isbn_test not in CACHE_GOOGLE_NOT_FOUND and isbn_test not in CACHE_NO_FIELD["author"]:
+            time.sleep(2.5)
 
     # Aplicar cambios
     if cambios_nulls:

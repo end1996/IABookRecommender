@@ -14,3 +14,4 @@ book_catalog_features_kaggle.csv
 
 # Trained ML models (generated from Colab)
 models/*.pkl
+output/
