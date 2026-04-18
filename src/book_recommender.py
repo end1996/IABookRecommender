@@ -24,6 +24,19 @@ if os.path.exists(MODELO_CLASIFICADOR_PATH):
 else:
     print(f"⚠️  No se encontró {MODELO_CLASIFICADOR_PATH}. Sin bonus de categoría en scoring.")
 
+# =====================================================
+# VECTORIZADOR TF-IDF: Vocabulario congelado (.pkl)
+# Entrenado en Colab para inferencia directa.
+# =====================================================
+MODELO_VECTORIZADOR_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "recommender_tfidf_v1.pkl")
+
+vectorizer_preentrenado = None
+if os.path.exists(MODELO_VECTORIZADOR_PATH):
+    vectorizer_preentrenado = joblib.load(MODELO_VECTORIZADOR_PATH)
+    print(f"✅ Vectorizador TF-IDF cargado: {MODELO_VECTORIZADOR_PATH}")
+else:
+    print(f"❌ Error crítico: No se encontró {MODELO_VECTORIZADOR_PATH}. El script fallará en la fase 4.")
+
 # Construimos la URL usando el diccionario de settings.py
 DB_URL = (
     f"mysql+mysqlconnector://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
@@ -54,84 +67,7 @@ PESO_AUTOR = 0.10
 # por idioma, elegibilidad (stock/WC), y deduplicación de títulos.
 CANDIDATOS_POR_LIBRO = CANTIDAD_RECOMENDACIONES * 15
 
-# =====================================================
-# Stopwords bilingües (español + inglés)
-# Se incluyen ambos idiomas porque el TF-IDF se entrena sobre TODO
-# el catálogo (ES + EN) junto. Sin stopwords en inglés, palabras como
-# "the", "and", "book" crearían ruido en la matriz de features.
-# Filtrarlas mejora la calidad de todos los vectores sin afectar
-# negativamente las recomendaciones por idioma (esas palabras no
-# aportan valor discriminativo en ningún idioma).
-# =====================================================
-STOPWORDS_ESPANOL = [
-    # Artículos, preposiciones, pronombres y conjunciones del español
-    'el', 'la', 'de', 'que', 'y', 'a', 'en', 'un', 'una', 'por', 'con', 'para',
-    'su', 'se', 'del', 'las', 'los', 'al', 'lo', 'como', 'más', 'pero', 'sus',
-    'le', 'ya', 'o', 'este', 'sí', 'porque', 'esta', 'entre', 'cuando', 'muy',
-    'sin', 'sobre', 'también', 'me', 'hasta', 'hay', 'donde', 'quien', 'desde',
-    'todo', 'nos', 'durante', 'todos', 'uno', 'les', 'ni', 'contra', 'otros',
-    'ese', 'eso', 'ante', 'ellos', 'esto', 'mí', 'antes', 'algunos', 'qué',
-    'unos', 'yo', 'otro', 'otras', 'otra', 'él', 'tanto', 'esa', 'estos',
-    'mucho', 'quienes', 'nada', 'muchos', 'cual', 'poco', 'ella', 'estar',
-    'estas', 'algunas', 'algo', 'nosotros', 'mi', 'mis', 'tú', 'te', 'ti',
-    'tu', 'tus', 'ellas', 'nosotras', 'es', 'soy', 'eres', 'somos', 'son',
-    'fui', 'fue', 'fueron', 'ha', 'han', 'ser', 'sido', 'tiene', 'tienen',
-    'había', 'haber', 'hacer', 'puede', 'siendo', 'así', 'después',
-    # Palabras del dominio literario/editorial que aparecen en casi todas
-    # las descripciones y no aportan señal discriminativa entre géneros
-    'historia', 'vida', 'mundo', 'años', 'días', 'hombres',
-    'libro', 'libros', 'edición', 'editorial', 'tomo', 'colección', 'serie',
-    'autor', 'leer', 'lectura', 'página', 'páginas', 'obra', 'obras',
-    'texto', 'textos', 'capítulo', 'capítulos', 'volumen',
-    'nuevo', 'nueva', 'nuevos', 'nuevas', 'gran', 'grande', 'grandes',
-    'primer', 'primera', 'mejor', 'manera', 'forma', 'parte', 'tiempo',
-    'lugar', 'cada', 'través', 'cuenta', 'hombre', 'mujer',
-    'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete', 'ocho', 'nueve', 'diez',
-    # Palabras genéricas que aparecen en infantil, juvenil y ficción sin
-    # discriminar entre ellas. Filtrarlas mejora la separación de categorías
-    # adyacentes (infantil vs juvenil) en el espacio TF-IDF.
-    'pequeño', 'pequeña', 'pequeños', 'pequeñas', 'niño', 'niña', 'niños',
-    'niñas', 'aventura', 'aventuras', 'divertido', 'divertida', 'amigos',
-    'familia', 'escuela', 'joven', 'jóvenes', 'perfecto', 'perfecta',
-    # Términos comerciales y de marketing (ruido)
-    'derechos', 'reservados', 'bestseller', 'impreso',
-]
 
-STOPWORDS_INGLES = [
-    # Equivalentes en inglés: artículos, preposiciones, pronombres
-    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-    'of', 'with', 'by', 'from', 'is', 'it', 'as', 'was', 'are', 'be',
-    'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-    'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can',
-    'not', 'no', 'nor', 'so', 'if', 'then', 'than', 'too', 'very',
-    'just', 'about', 'above', 'after', 'again', 'all', 'also', 'am',
-    'any', 'because', 'before', 'between', 'both', 'each', 'few',
-    'further', 'get', 'got', 'he', 'her', 'here', 'him', 'his', 'how',
-    'into', 'its', 'let', 'me', 'more', 'most', 'my', 'now', 'off',
-    'only', 'other', 'our', 'out', 'over', 'own', 'same', 'she', 'some',
-    'still', 'such', 'that', 'their', 'them', 'there', 'these', 'they',
-    'this', 'those', 'through', 'under', 'until', 'up', 'us', 'we',
-    'what', 'when', 'where', 'which', 'while', 'who', 'whom', 'why',
-    'you', 'your', 'yours', 'yourself',
-    # Palabras del dominio editorial en inglés
-    'book', 'books', 'story', 'stories', 'novel', 'edition', 'chapter',
-    'author', 'read', 'reading', 'page', 'pages', 'volume', 'series',
-    'new', 'great', 'first', 'one', 'two', 'three', 'way', 'time',
-    'world', 'life', 'year', 'years', 'man', 'woman', 'day', 'days',
-    'many', 'much', 'well', 'back', 'even', 'also', 'made', 'make',
-    'like', 'set', 'part', 'long', 'find', 'work', 'come', 'take',
-    # Palabras genéricas infantil/juvenil/ficción que no discriminan entre
-    # categorías adyacentes y contaminan el espacio TF-IDF.
-    'fun', 'little', 'perfect', 'children', 'young', 'kids', 'readers',
-    'love', 'family', 'friends', 'school', 'adventure', 'join', 'old',
-    'best', 'people', 'never', 'help', 'favorite', 'learn', 'play',
-    # Corporate noise and marketing
-    'ltd', 'inc', 'llc', 'press', 'publishing', 'rights', 'reserved',
-    'bestselling', 'bestseller', 'york', 'times', 'big', 'copyright',
-]
-
-# Se combinan ambas listas para alimentar el TfidfVectorizer
-STOPWORDS_BILINGUE = STOPWORDS_ESPANOL + STOPWORDS_INGLES
 
 # Regex para separar strings con múltiples autores (ej. "García, Borges | Paz")
 SEPARADORES_AUTORES = r'[,|;/&]'
@@ -307,26 +243,21 @@ sin_grupo = df['grupo_categoria'].isna().sum()
 print(f"   → {grupos_encontrados} grupos de categoría detectados, {sin_grupo} libros con categoría de ruido/sin categoría")
 
 # =====================================================
-# 4. Entrenar modelo TF-IDF (bigrams + sublinear_tf)
+# 4. Inferencia con modelo TF-IDF
 #
-# TF-IDF convierte cada texto en un vector numérico donde cada dimensión
-# representa la importancia de un término (o bigrama) para ese documento.
+# A diferencia del entrenamiento, ahora cargamos nuestro
+# conocimiento congelado (vocabulario y pesos) desde el notebook
+# y aplicamos una transformación instantánea al catálogo.
 # =====================================================
-print("4. Entrenando el modelo TF-IDF (bigrams + sublinear_tf + stopwords bilingues)...")
-vectorizer = TfidfVectorizer(
-    max_df=0.65,         # Ignora términos en >65% de documentos (más estricto contra relleno genérico)
-    min_df=2,            # Ignora términos en <2 documentos (demasiado raros)
-    stop_words=STOPWORDS_BILINGUE,
-    ngram_range=(1, 2),  # Captura unigramas y bigramas (ej. "guerra civil", "amor prohibido")
-    sublinear_tf=True,   # Aplica log(1 + tf), reduce impacto de palabras muy repetidas
-    max_features=50000,  # Limita el vocabulario para controlar uso de memoria
-    # Exige que cada token EMPIECE con una letra, descartando tokens numéricos
-    # o con prefijo numérico ('000', '100th', '1000stickers') que vienen de
-    # marketing y no aportan señal discriminativa entre géneros.
-    token_pattern=r'(?u)\b[a-zA-ZáéíóúñüÀ-ÿ]\w+\b'
+print("4. Aplicando modelo TF-IDF pre-entrenado desde el notebook...")
+if vectorizer_preentrenado is None:
+    print("❌ Error crítico: No se encontró el vectorizador TF-IDF ('recommender_tfidf_v1.pkl').")
+    print("   Asegurate de exportarlo desde tu notebook en la carpeta '/models/'.")
+    exit(1)
 
-)
-tfidf_matrix = vectorizer.fit_transform(df['Texto_IA'])
+# Usamos .transform() para aplicar el vocabulario estático a los libros, 
+# conservando la integridad de las distancias evaluadas.
+tfidf_matrix = vectorizer_preentrenado.transform(df['Texto_IA'])
 
 # =====================================================
 # 5. Entrenar modelo NearestNeighbors
