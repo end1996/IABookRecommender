@@ -759,15 +759,15 @@ def fase_descripcion(dry_run=False, limit=None):
                 count_lm_studio += 1
 
         if descripcion:
-            # Aplicamos formato HTML antes de guardar si la fase formatea automático
-            descripcion_html = convertir_a_html_legible(descripcion)
+            # Ya no aplicamos formato HTML aquí. La BD debe quedar limpia (texto plano).
+            # El backend de Java se encargará de crear el HTML al vuelo para WooCommerce.
             cambios.append({
                 "id": book_id,
                 "sku": sku,
                 "titulo": titulo,
                 "fuente": fuente,
                 "descripcion": descripcion[:200] + "..." if len(descripcion) > 200 else descripcion,
-                "descripcion_completa": descripcion_html,
+                "descripcion_completa": descripcion,
             })
         else:
             count_sin += 1
@@ -813,66 +813,18 @@ def fase_descripcion(dry_run=False, limit=None):
 
 
 # =====================================================
-# FASE 2.5: Formato HTML
+# FASE 2.5: Formato HTML (DEPRECADO)
 # =====================================================
 def fase_formato_html(dry_run=False, limit=None):
-    """Fase intermidia: Convierte a HTML todas las descripciones en BD que sean texto plano."""
-    print("\n" + "=" * 60)
-    print("🎨 FASE 2.5: Conversión a HTML de descripciones")
-    print("=" * 60)
-
-    # Consultar libros con descripción pero sin formato HTML
-    query = """
-        SELECT id, sku, title, description
-        FROM books
-        WHERE description IS NOT NULL 
-          AND TRIM(description) != '' 
-          AND description NOT LIKE '%<p>%'
+    """Fase intermidia: DEPRECADA. 
+    Ya no se convierte a HTML en la BD. El backend Java genera el HTML en memoria 
+    antes de enviarlo a WooCommerce, manteniendo la base de datos limpia de etiquetas web.
     """
-    if limit:
-        query += f" LIMIT {int(limit)}"
-
-    with engine.connect() as conn:
-        rows = conn.execute(text(query)).fetchall()
-
-    if not rows:
-        print("   ✅ Todas las descripciones ya tienen formato HTML o no hay descripciones para procesar.")
-        return {"total": 0, "formateados": 0}
-
-    print(f"   → {len(rows)} descripciones necesitan formato HTML")
-
-    cambios = []
-    for row in tqdm(rows, desc="Convirtiendo a HTML"):
-        book_id, sku, titulo, desc_actual = row
-        desc_html = convertir_a_html_legible(desc_actual)
-        if desc_html and desc_html != desc_actual:
-            cambios.append({"id": book_id, "sku": sku, "titulo": titulo, "html": desc_html})
-
-    if cambios:
-        if dry_run:
-            print(f"\n🔍 DRY-RUN: Se formatearían {len(cambios)} descripciones:")
-            for c in cambios[:10]:
-                print(f"   [{c['sku']}] \"{c['titulo'][:40]}\"")
-                print(f"      → {c['html'][:80]}...")
-            if len(cambios) > 10:
-                print(f"   ... y {len(cambios) - 10} más")
-        else:
-            print(f"\n💾 Guardando {len(cambios)} descripciones en formato HTML...")
-            with engine.begin() as conn:
-                sql = text("UPDATE books SET description = :html WHERE id = :id")
-                lote = []
-                for i, c in enumerate(cambios):
-                    lote.append({"html": c["html"], "id": c["id"]})
-                    if (i + 1) % 50 == 0:
-                        conn.execute(sql, lote)
-                        lote.clear()
-                if lote:
-                    conn.execute(sql, lote)
-            print("   ✅ Descripciones formateadas correctamente.")
-            
-    stats = {"total": len(rows), "formateados": len(cambios)}
-    print(f"\n📊 Fase 2.5: {len(cambios)}/{len(rows)} descripciones convertidas a HTML")
-    return stats
+    print("\n" + "=" * 60)
+    print("🎨 FASE 2.5: Conversión a HTML (DEPRECADA)")
+    print("=" * 60)
+    print("   ✅ Operación salteada: El formato HTML ahora es responsabilidad exclusiva del backend de Java para mantener la base de datos limpia.")
+    return {"total": 0, "formateados": 0}
 
 
 # =====================================================
