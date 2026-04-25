@@ -9,9 +9,9 @@
 
 <br/>
 
-**IABookRecommender** es el motor de Inteligencia Artificial para el sistema de inventario de libros. Este proyecto en Python genera recomendaciones automatizadas usando Procesamiento de Lenguaje Natural (NLP) y enriquece la metadata del catálogo integrándose con LLMs locales (LM Studio) y APIs externas (Google Books).
+**IABookRecommender** es el núcleo de Inteligencia Artificial y de datos para el sistema de inventario de libros. Este proyecto en Python opera bajo una arquitectura MLOps para generar recomendaciones automatizadas de alta precisión mediante un *score* compuesto algorítmicamente (TF-IDF + SGDClassifier + Intersección de Autores). Además, implementa un robusto pipeline de enriquecimiento e higiene del catálogo, integrándose con APIs externas (Google Books, Open Library) y LLMs locales (LM Studio), fuertemente respaldado por estrategias de *Multi-Layer Caching*.
 
-Funciona como un **proceso batch independiente** que se comunica exclusivamente a través de la base de datos MySQL compartida, sin acoplamiento directo con el backend (Spring Boot) ni el frontend (React).
+Funciona como un conjunto de **procesos batch independientes** que se comunican exclusivamente a través de la base de datos MySQL compartida, logrando un desacoplamiento total y seguro respecto al backend (Spring Boot) y al frontend (React).
 
 ---
 
@@ -19,16 +19,17 @@ Funciona como un **proceso batch independiente** que se comunica exclusivamente 
 
 ### 🧠 Motor de Recomendaciones (`book_recommender.py`)
 Genera automáticamente un ranking de hasta 20 recomendaciones personalizadas por libro basado en afinidad semántica.
-- **Modelo NLP Clásico:** Utiliza **TF-IDF** (Term Frequency–Inverse Document Frequency) combinado con **KNN** (NearestNeighbors con distancia coseno) en lugar de un LLM externo para mayor eficiencia y menor costo.
-- **Score Compuesto Ponderado:** Considera el contenido de las descripciones (45%), la similitud de categorías normalizadas (45%), y coincidencias de autores (10%).
-- **Tolerancia Bilingüe:** Stopwords especializadas tanto en inglés como en español.
-- **Filtros Adaptables:** Evita recomendar libros sin stock o de distintas versiones del mismo título para WooCommerce.
+- **Flujo MLOps y Modelos Pre-entrenados:** En producción, carga modelos pre-entrenados exportados vía `joblib` desde la carpeta `/models/` (TF-IDF Vectorizer y SGDClassifier), utilizando `.transform()` para asegurar consistencia 1:1 con el entorno de entrenamiento, mientras mantiene el modelo `NearestNeighbors` de forma dinámica para adaptarse al nuevo stock en tiempo real.
+- **Clasificador SGDClassifier:** Emplea una asignación automatizada de categorías basada en un pipeline de aprendizaje automático (SGDClassifier) con *fallback strategies*, dejando atrás el mapeo estático de JSON.
+- **Vectorización Pura:** Se extraen dinámicamente los nombres de autores y etiquetas corporativas del texto. El vectorizador **excluye explícitamente** la categoría y autor del corpus TF-IDF, alimentándose solo del título y descripción limpia para evaluar exclusivamente afinidad narrativa.
+- **Score Compuesto Ponderado:** Tras vectorizar, el modelo combina las distancias: contenido semántico TF-IDF (45%), afinidad binaria de categoría predicha por el SGDClassifier (45%), y coincidencias de autores (10%).
 
 ### 🌐 Pipeline de Enriquecimiento (`book_data_enrichment.py`)
 Mejora y normaliza la metadata del catálogo en la base de datos dividiéndose en 3 fases:
 - **Detección de Idioma:** Offline ultrarrápido usando la librería `lingua` (identifica ~89% de libros instantáneamente), completando con Qwen MLLM (vía LM Studio localmente) para títulos ambiguos o bilingües.
-- **Enriquecimiento de Descripciones:** Consulta API de Google Books (vía ISBN) con un *fallback* a LM Studio que genera descripciones orgánicas de 2-3 frases comerciales de alto impacto.
-- **Normalización de Autores:** Limpia atributos redundantes (como "PhD", "Dr."), estandariza a *Title Case* y resuelve nombres invertidos (ej: `"Collins, Clifton"` -> `"Clifton Collins"`), rellenando vacíos adicionales vía API/LLM.
+- **Enriquecimiento Multinivel y Resiliencia:** Para descripciones y autores faltantes, consulta la **API de Google Books** apoyándose en un fallback gratuito hacia **Open Library** para no agotar cuotas. Además, implementa **Title Fuzzy Matching** para evitar contaminación de datos por ISBN erróneos.
+- **Multi-Layer Caching:** Incorpora caché negativo (para ISBNs inexistentes) y caché a nivel de campo para reducir drásticamente la latencia, la cuota de red y proteger al sistema ante bloqueos (Throttling 503).
+- **Normalización de Autores:** Estandariza atributos (Title Case, limpia "Dr.", etc.) y resuelve autores invertidos (`"Collins, Clifton"` -> `"Clifton Collins"`), utilizando IA Generativa (Qwen) como último recurso.
 
 ---
 
@@ -55,12 +56,13 @@ El script opera exclusivamente en nivel de base de datos sin levantar puertos:
 
 | Librería / Dependencia | Propósito |
 |-------------------------|-----------|
-| `scikit-learn` | Modelaje y distanciación del Coseno (TF-IDF, NearestNeighbors) |
-| `pandas` / `numpy` | Procesamiento vectorizado de DataFrames masivos |
-| `SQLAlchemy` | Motor ORM transaccional usando `mysql-connector-python` |
-| `lingua` | Detección NLP de idiomas de altísima velocidad y fiabilidad offline |
-| `requests` | Llamado sin bloqueos a endpoints REST HTTP (LM Studio / Google) |
-| `tqdm` | Control local del status de procesos batch mediante barras TUI |
+| `scikit-learn` / `joblib` | Modelaje clásico (TF-IDF, NearestNeighbors, SGDClassifier) y carga de modelos serializados (MLOps). |
+| `pandas` / `numpy` | Procesamiento vectorizado masivo de catálogos y manipulación analítica de datos tabulares. |
+| `SQLAlchemy` / `mysql-connector-python` | Motor ORM transaccional y driver nativo para operaciones directas a la base de datos de producción. |
+| `lingua-language-detector` | Detección NLP de idiomas de altísima velocidad y fiabilidad offline (fase 1 del pipeline). |
+| `requests` | Comunicación REST asíncrona hacia Google Books, Open Library y el motor local LM Studio. |
+| `tqdm` / `colorama` | Control de status visual mediante barras de progreso en terminal e impresión a color. |
+| `torch` / `sentence-transformers` | Ecosistema PyTorch y BGE-M3 acelerado por GPU (DirectML) utilizado exclusivamente en entorno I+D (`research/`). |
 
 ---
 
@@ -77,10 +79,13 @@ IABookRecommender/
 │   └── settings.py               # Exposición y unificación lógica del .env
 ├── docs/
 │   └── IMPLEMENTACION.md         # Documentación técnica (fases, pesos del score, etc.)
+├── models/                       # Modelos MLOps pre-entrenados (e.g., SGDClassifier, TF-IDF .pkl)
+├── output/                       # Cachés negativas de APIs, mismatches e insumos dinámicos
+├── research/                     # Scripts de I+D (ej: clasificador de libros con PyTorch BGE-M3)
 └── src/
     ├── __init__.py
     ├── book_recommender.py       # Algoritmo de recomendaciones NLP
-    └── book_data_enrichment.py   # Pipeland de refinamiento de metadata del catálogo
+    └── book_data_enrichment.py   # Pipeline de refinamiento de metadata del catálogo
 ```
 
 ---
@@ -93,16 +98,25 @@ IABookRecommender/
    cd IABookRecommender
    ```
 
-2. **Crea e inicializa el entorno virtual de Python** (Instrucciones para Windows):
+2. **Creación del Entorno Virtual (Aislamiento de dependencias)**:
+   Es vital usar un entorno virtual para que las dependencias de *research* (como PyTorch) no contaminen tu entorno global de Python.
    ```bash
+   # Crear el entorno virtual llamado 'venv'
    python -m venv venv
+   
+   # Activar el entorno (Windows)
    venv\Scripts\activate
    ```
 
-3. **Carga los paquetes dependientes**:
+3. **Instalación de paquetes requeridos**:
+   Instala las librerías exactas que garantizan el funcionamiento de producción y de I+D.
    ```bash
    pip install -r requirements.txt
    ```
+   > **Tip de Mantenimiento:** Si durante el desarrollo instalás nuevos paquetes (por ejemplo, `pip install nueva_libreria`), debés registrar ese cambio actualizando la lista oficial del proyecto con el siguiente comando:
+   > ```bash
+   > pip freeze > requirements.txt
+   > ```
 
 4. **Settear Base de Datos vía variables de entorno**:
    - Clona `.env.example` en formato `.env`
@@ -133,7 +147,7 @@ python -m src.book_recommender
 ### Modo 2: Enriquecimiento Total del Catálogo Inteligente
 Se encarga de levantar y reparar la metadata del catálogo existente.
 ```bash
-# Ejecutar todas las fases
+# Ejecutar todas las fases (Idioma -> Descripciones -> Autores)
 python -m src.book_data_enrichment 
 
 # Ejecutar componentes modulares de manera particular
@@ -144,4 +158,14 @@ python -m src.book_data_enrichment --phase author
 # Testealo primero. Modo Simulación sin afectar la BD (--dry-run)
 python -m src.book_data_enrichment --dry-run
 python -m src.book_data_enrichment --limit 20 --dry-run
+```
+
+### Modo 3: Utilidad de Normalización de Autores (Script Aislado)
+Este script `normalize_authors.py` es una utilidad de mantenimiento que limpia la data existente de autores (corrige capitalización "Title Case", elimina apodos entre comillas, remueve credenciales académicas como "PhD" y reordena formatos tipo "Apellido, Nombre" a "Nombre Apellido"). Opera como un flujo aislado que *sólo* muta la base de datos si hay mejoras evidentes, pero no rellena autores nulos (eso lo hace el Modo 2).
+```bash
+# 1. Analizar cuánta basura hay y exportar un reporte para auditar
+python -m src.normalize_authors --dry-run --export-csv
+
+# 2. Aplicar la limpieza estructural a toda la base de datos de producción
+python -m src.normalize_authors
 ```

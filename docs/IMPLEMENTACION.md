@@ -1,8 +1,14 @@
 # Implementación del Software — Módulo de Recomendaciones con IA
 
-## 1. Descripción del Script de Python
+## 1. Descripción General de la Arquitectura IA
 
-El módulo `book_recommender.py` es un script de procesamiento por lotes que se conecta directamente a la base de datos MySQL del sistema de inventario, extrae el catálogo completo de libros (títulos, categorías, descripciones e idiomas), y aplica técnicas de **Procesamiento de Lenguaje Natural (NLP)** mediante el modelo **TF-IDF (Term Frequency–Inverse Document Frequency)** combinado con **Similitud del Coseno** para calcular la afinidad semántica entre cada par de libros. A partir de estas métricas, genera automáticamente un ranking de hasta 20 recomendaciones personalizadas por producto, filtrando duplicados y respetando restricciones de idioma y categoría. Finalmente, escribe los resultados directamente en la tabla `product_recommendations` de la misma base de datos, permitiendo que el backend y frontend consuman estas recomendaciones sin intervención manual.
+El proyecto se consolida como un conjunto de procesos *batch* modulares y desacoplados que interactúan directamente con la base de datos MySQL del sistema de inventario. Su funcionalidad se divide en tres pilares:
+
+1. **Motor de Recomendaciones (`book_recommender.py`)**: Extrae el catálogo filtrado y utiliza una arquitectura MLOps cargando modelos predictivos exportados. Genera un ranking altamente optimizado (hasta 20 recomendaciones por producto) evaluando una fórmula de afinidad compuesta: similitud semántica pura (TF-IDF Vectorizer + `NearestNeighbors`), clasificación inteligente de categorías (`SGDClassifier`) y validación autoral, respetando siempre las restricciones de stock y el idioma de la obra.
+2. **Enriquecimiento Resiliente (`book_data_enrichment.py`)**: Completa la metadata faltante (idiomas, descripciones) conectándose dinámicamente a APIs (Google Books, Open Library) y LLMs locales (Qwen vía LM Studio), asegurando alta disponibilidad a través de estrategias de *Multi-Layer Caching* y *Fuzzy Matching*.
+3. **Higiene de Datos (`normalize_authors.py`)**: Módulo utilitario que sanitiza y estructura proactivamente los metadatos internos existentes (Title Case, inversión de nombres, eliminación de credenciales), maximizando el éxito del NLP.
+
+El resultado de estas fases se escribe transaccionalmente en la base de datos (e.g. `product_recommendations`), sirviendo la data pre-computada y curada para que el backend y frontend la consuman al instante.
 
 ---
 
@@ -10,15 +16,17 @@ El módulo `book_recommender.py` es un script de procesamiento por lotes que se 
 
 | Librería | Versión | Propósito |
 |---|---|---|
-| `pandas` | — | Manipulación y análisis de datos tabulares (DataFrames) |
-| `sqlalchemy` | — | ORM y motor de conexión a bases de datos relacionales |
-| `mysql-connector-python` | — | Driver nativo para la conexión MySQL desde Python |
-| `scikit-learn` | 1.8.0 | Modelos de Machine Learning: `TfidfVectorizer` y `cosine_similarity` |
-| `numpy` | — | Operaciones matemáticas vectorizadas (ordenamiento de índices) |
-| `scipy` | — | Dependencia de `scikit-learn` para cálculos científicos |
-| `tqdm` | — | Barras de progreso en terminal para monitorizar el procesamiento |
-| `python-dotenv` | — | Carga de variables de entorno desde archivo `.env` |
+| `pandas` | 3.0.1 | Manipulación y análisis de datos tabulares (DataFrames) |
+| `sqlalchemy` | 2.0.48 | ORM y motor de conexión a bases de datos relacionales |
+| `mysql-connector-python` | 9.6.0 | Driver nativo para la conexión MySQL desde Python |
+| `scikit-learn` | 1.8.0 | Modelos de Machine Learning: `TfidfVectorizer`, `NearestNeighbors` y `SGDClassifier` |
+| `joblib` | 1.5.3 | Carga persistente de modelos de IA exportados (Flujo MLOps) |
+| `numpy` | 2.4.2 | Operaciones matemáticas vectorizadas (ordenamiento de índices) |
+| `lingua-language-detector` | 2.1.1 | Detección NLP offline de alta velocidad para fases de enriquecimiento |
+| `requests` | 2.32.5 | Peticiones HTTP REST para APIs externas y modelo local LM Studio |
+| `tqdm` | 4.67.3 | Barras de progreso en terminal para monitorizar el procesamiento |
 | `colorama` | 0.4.6 | Colores en la salida de terminal (compatibilidad Windows) |
+| `torch` / `sentence-transformers` | 2.4.1 / 5.4.0 | Aceleración matemática (DirectML) y NLP avanzado, exclusivos para entorno de investigación (I+D) |
 
 > **Motor de IA utilizado:** No se emplea un LLM externo (como GPT o Gemini). El modelo inteligente es **TF-IDF + Similitud del Coseno** de `scikit-learn`, un enfoque clásico de NLP que vectoriza los textos del catálogo y calcula la distancia semántica entre ellos de forma local, sin llamadas a APIs externas.
 
@@ -164,44 +172,47 @@ except Exception as e:
 
 ### 6.2 Paso 2 — Preprocesamiento y limpieza de textos
 
-Los datos en bruto se normalizan: se limpian etiquetas HTML de las descripciones y se construye un texto enriquecido que **pondera la categoría 5 veces** para darle mayor relevancia semántica frente al título y la descripción:
+Los datos en bruto se normalizan aplicando múltiples capas de limpieza para evitar *overfitting* (sobreajuste): se limpian etiquetas HTML, se usan expresiones regulares (regex) para remover jerga corporativa y promocional, y se **eliminan dinámicamente los nombres de los autores** del texto para evitar que el motor solo recomiende libros del mismo escritor. Luego, se construye el texto base para la vectorización:
 
 ```python
 print("2. Procesando textos y normalizando...")
 df['title'] = df['title'].fillna('')
-df['category'] = df['category'].fillna('')
-# ... lógica de procesamiento ...
+df['description'] = df['description'].fillna('')
 
+# ... lógica de limpieza regex y eliminación dinámica de autores ...
 df['Texto_IA_Limpio'] = df['description'].apply(limpiar_html)
-df['Texto_IA'] = (df['category'] + " ") * 5 + df['title'] + " " + df['Texto_IA_Limpio']
+
+# IMPORTANTE: La categoría NO se incluye en el corpus textual del TF-IDF.
+# El autor explícito TAMPOCO, ya que ambos tienen su propio peso en la fórmula del score compuesto.
+df['Texto_IA'] = df['title'] + " " + df['Texto_IA_Limpio']
 ```
 
-> **Decisión de diseño:** Multiplicar la categoría ×5 en el texto de entrada asegura que libros de la misma categoría tengan mayor similitud semántica, priorizando la relevancia temática sobre coincidencias casuales de palabras en las descripciones.
+> **Decisión de diseño:** El vectorizador se alimenta exclusivamente de la "narrativa" pura (título y descripción). Excluir explícitamente la categoría y el autor del corpus TF-IDF evita el emparejamiento erróneo causado por compartir la misma etiqueta estática de género o el mismo nombre de autor repetido (ruido sintáctico), ya que estas dimensiones operan algorítmicamente en su propio componente de la fórmula de afinidad.
 
-### 6.3 Paso 3 — Entrenamiento del modelo TF-IDF (Núcleo de IA)
+### 6.3 Paso 3 — Carga del Pipeline MLOps y Vectorización (Núcleo de IA)
 
-Esta es la **función central del motor de inteligencia artificial**. Se configura el vectorizador TF-IDF con *stopwords* en español personalizadas y umbrales de frecuencia para filtrar ruido, y se transforma todo el corpus en una matriz de vectores numéricos:
+A diferencia de modelos dinámicos que se entrenan al vuelo, el sistema en producción emplea un flujo de trabajo **MLOps**. Esto significa que los modelos pesados se entrena en un entorno dedicado (como Jupyter/Colab) y se exportan para ser cargados en producción vía `joblib`. Se cargan dos componentes principales:
+- **SGDClassifier:** Un modelo entrenado para asignar automáticamente categorías faltantes, eliminando la dependencia de un archivo JSON estático.
+- **TfidfVectorizer:** El vectorizador configurado con *stopwords* bilingües. 
+
+En lugar de usar `fit_transform()`, el script utiliza explícitamente `.transform()` para aplicar la transformación instantánea:
 
 ```python
-print("3. Entrenando el modelo TF-IDF...")
+print("3. Cargando modelos pre-entrenados y vectorizando...")
 
-STOPWORDS_ESPANOL = ['el', 'la', 'de', 'que', 'y', 'a', 'en',
-                     'un', 'una', 'por', 'con', 'para', 'su',
-                     # ... lista completa de stopwords ...
-                     'historia', 'vida', 'mundo', 'años']
+# Carga de modelos exportados
+clf_categorias = joblib.load(MODELO_CLASIFICADOR_PATH)
+vectorizer_preentrenado = joblib.load(MODELO_VECTORIZADOR_PATH)
 
-vectorizer = TfidfVectorizer(
-    max_df=0.80,      # Ignora términos en >80% de documentos
-    min_df=2,          # Ignora términos en <2 documentos
-    stop_words=STOPWORDS_ESPANOL
-)
-tfidf_matrix = vectorizer.fit_transform(df['Texto_IA'])
+# Aplicar modelo SGDClassifier (clasificación de categorías automatizada)
+# ... lógica predictiva ...
+
+# Vectorización con vocabulario estático
+tfidf_matrix = vectorizer_preentrenado.transform(df['Texto_IA'])
 ```
 
-> **Parámetros del modelo:**
-> - `max_df=0.80`: Descarta palabras que aparecen en más del 80% de los libros (demasiado comunes para ser discriminativas).
-> - `min_df=2`: Descarta palabras que aparecen en menos de 2 libros (demasiado raras para generar conexiones).
-> - `stop_words`: Lista personalizada de 100+ palabras vacías en español, incluyendo términos genéricos del dominio literario como "historia", "vida", "mundo".
+> **Parámetros del vectorizador exportado:**
+> El modelo original fue configurado con `max_df=0.80`, `min_df=2`, e inyección de *stopwords* bilingües personalizadas para filtrar términos narrativos comunes ("historia", "mundo"). Al usar `.transform()`, se asegura una consistencia algorítmica total entre las pruebas y el servidor de producción.
 
 ### 6.4 Paso 4 — Cálculo de similitud y generación de recomendaciones
 
@@ -313,3 +324,42 @@ python -m src.book_recommender
 [CAPTURA: Terminal mostrando la ejecución completa del script con los mensajes de cada paso y el mensaje final "¡Éxito! Proceso finalizado y base de datos actualizada."]
 
 [CAPTURA: Vista del frontend mostrando la sección de "Libros Recomendados" para un producto, alimentada por los datos generados por este script]
+
+---
+
+## 8. Pipeline de Enriquecimiento (Data Enrichment)
+
+Junto al motor de recomendaciones, el archivo `book_data_enrichment.py` maneja la optimización del catálogo implementando prácticas de alta resiliencia y mitigación de errores.
+
+### 8.1 Mitigación de Throttling y Resiliencia de API
+Debido a las estrictas cuotas de servicios como la API de Google Books (Errores 503), el sistema usa una doble estrategia de redundancia:
+- **Fallback a Open Library:** Si Google Books no responde o agota su cuota, se realiza una búsqueda secundaria asíncrona hacia Open Library (fuente gratuita sin límites duros).
+- **Control de Calidad (Fuzzy Matching):** En lugar de confiar a ciegas en el ISBN, se verifica la similitud del título usando algoritmos *fuzzy*. Si hay "contaminación de ISBN" (ej: ISBN pertenece a otro libro o idioma), la API es descartada sin detener el flujo global (*batch process*).
+
+### 8.2 Multi-layer Caching (Caché Estratégica en `output/`)
+Para minimizar las peticiones de red redundantes, existen dos capas persistentes guardadas dinámicamente en el directorio de `output/`:
+- **Caché a nivel de Campo (Field-level Caching):** Archivos como `google_books_no_description.txt` y `google_books_no_author.txt` que previenen consultas repetidas sobre metadatos que sabemos que ya fallaron anteriormente en ser provistos por la API.
+- **Caché Negativa (Negative Caching):** Si un ISBN es inválido o se comprueba que no existe en las APIs externas, el script guarda este "estado de inexistencia" en `google_books_not_found.txt`.
+- **Mismatches:** Las colisiones y discrepancias algorítmicas entre el catálogo base y las APIs externas (por la validación de *Fuzzy Matching*) se exportan a un CSV de auditoría (`isbn_mismatches_pendientes.csv`).
+
+---
+
+## 9. Pipeline Utilitario: Normalización de Autores (`normalize_authors.py`)
+
+Aparte del ciclo principal de recomendaciones y enriquecimiento, existe un flujo aislado destinado exclusivamente a la **higiene de datos**: el script `normalize_authors.py`. 
+Este módulo recorre la base de datos buscando autores ya existentes y aplica una serie de limpiezas algorítmicas sin realizar llamadas a APIs externas:
+- Inversiones `Apellido, Nombre` → `Nombre Apellido`.
+- Remoción de credenciales académicas inyectadas como basura (`PhD`, `Dr.`, `MD`).
+- Estandarización a *Title Case*.
+- Detección de entidades nulas o "solo basura" (las exporta a un CSV para auditoría, pero no las borra automáticamente por seguridad).
+
+Su ejecución está desacoplada porque es una tarea de mantenimiento puntual, permitiendo a los administradores generar un reporte `--dry-run --export-csv` antes de impactar los datos en la base principal.
+
+---
+
+## 10. Arquitectura de I+D y Estructura MLOps
+
+El repositorio está fuertemente modularizado para asegurar que las pruebas de experimentación y desarrollo (I+D) no afecten al script de producción liviano.
+
+- **`models/`**: Aloja los objetos serializados con `joblib` (`clasificador_categorias_v3.pkl`, `recommender_tfidf_v1.pkl`). El script de recomendación solo carga la inferencia y no re-entrena los pesos.
+- **`research/`**: Espacio de *sandboxing*. Aquí se encuentra, por ejemplo, `clasificador_libros.py`, el script pesado utilizado originalmente para entrenar y re-clasificar datos en crudo apoyándose en el ecosistema PyTorch, aceleración GPU (AMD DirectML), y el modelo de vanguardia **BAAI/bge-m3** (con fusión de *Weighted Embeddings* divididos entre 65% Categoría y 35% Contenido). Todo esto ocurre en *offline research* y **no infla las dependencias** de la aplicación principal en `src/`.
